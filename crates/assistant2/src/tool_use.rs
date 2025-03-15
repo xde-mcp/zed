@@ -182,6 +182,13 @@ impl ToolUseState {
             .map_or(false, |results| !results.is_empty())
     }
 
+    pub fn tool_result(
+        &self,
+        tool_use_id: &LanguageModelToolUseId,
+    ) -> Option<&LanguageModelToolResult> {
+        self.tool_results.get(tool_use_id)
+    }
+
     pub fn request_tool_use(
         &mut self,
         assistant_message_id: MessageId,
@@ -226,12 +233,12 @@ impl ToolUseState {
         output: Result<String>,
     ) -> Option<PendingToolUse> {
         match output {
-            Ok(output) => {
+            Ok(tool_result) => {
                 self.tool_results.insert(
                     tool_use_id.clone(),
                     LanguageModelToolResult {
                         tool_use_id: tool_use_id.clone(),
-                        content: output.into(),
+                        content: tool_result.into(),
                         is_error: false,
                     },
                 );

@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use assistant_tool::ToolWorkingSet;
+use assistant_tool::{ActionLog, ToolWorkingSet};
 use chrono::{DateTime, Utc};
 use collections::{BTreeMap, HashMap, HashSet};
 use futures::future::Shared;
@@ -104,6 +104,7 @@ pub struct Thread {
     prompt_builder: Arc<PromptBuilder>,
     tools: Arc<ToolWorkingSet>,
     tool_use: ToolUseState,
+    action_log: Entity<ActionLog>,
     scripting_session: Entity<ScriptingSession>,
     scripting_tool_use: ToolUseState,
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -134,6 +135,7 @@ impl Thread {
             tool_use: ToolUseState::new(),
             scripting_session: cx.new(|cx| ScriptingSession::new(project.clone(), cx)),
             scripting_tool_use: ToolUseState::new(),
+            action_log: cx.new(|_| ActionLog::new()),
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project, cx);
                 cx.foreground_executor()
@@ -191,6 +193,7 @@ impl Thread {
             prompt_builder,
             tools,
             tool_use,
+            action_log: cx.new(|_| ActionLog::new()),
             scripting_session,
             scripting_tool_use,
             initial_project_snapshot: Task::ready(serialized.initial_project_snapshot).shared(),
@@ -279,6 +282,10 @@ impl Thread {
 
     pub fn tool_results_for_message(&self, id: MessageId) -> Vec<&LanguageModelToolResult> {
         self.tool_use.tool_results_for_message(id)
+    }
+
+    pub fn tool_result(&self, id: &LanguageModelToolUseId) -> Option<&LanguageModelToolResult> {
+        self.tool_use.tool_result(id)
     }
 
     pub fn scripting_tool_results_for_message(
@@ -649,32 +656,37 @@ impl Thread {
             let result = stream_completion.await;
 
             thread
-                .update(&mut cx, |thread, cx| match result.as_ref() {
-                    Ok(stop_reason) => match stop_reason {
-                        StopReason::ToolUse => {
-                            cx.emit(ThreadEvent::UsePendingTools);
-                        }
-                        StopReason::EndTurn => {}
-                        StopReason::MaxTokens => {}
-                    },
-                    Err(error) => {
-                        if error.is::<PaymentRequiredError>() {
-                            cx.emit(ThreadEvent::ShowError(ThreadError::PaymentRequired));
-                        } else if error.is::<MaxMonthlySpendReachedError>() {
-                            cx.emit(ThreadEvent::ShowError(ThreadError::MaxMonthlySpendReached));
-                        } else {
-                            let error_message = error
-                                .chain()
-                                .map(|err| err.to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            cx.emit(ThreadEvent::ShowError(ThreadError::Message(
-                                SharedString::from(error_message.clone()),
-                            )));
-                        }
+                .update(&mut cx, |thread, cx| {
+                    match result.as_ref() {
+                        Ok(stop_reason) => match stop_reason {
+                            StopReason::ToolUse => {
+                                cx.emit(ThreadEvent::UsePendingTools);
+                            }
+                            StopReason::EndTurn => {}
+                            StopReason::MaxTokens => {}
+                        },
+                        Err(error) => {
+                            if error.is::<PaymentRequiredError>() {
+                                cx.emit(ThreadEvent::ShowError(ThreadError::PaymentRequired));
+                            } else if error.is::<MaxMonthlySpendReachedError>() {
+                                cx.emit(ThreadEvent::ShowError(
+                                    ThreadError::MaxMonthlySpendReached,
+                                ));
+                            } else {
+                                let error_message = error
+                                    .chain()
+                                    .map(|err| err.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                cx.emit(ThreadEvent::ShowError(ThreadError::Message(
+                                    SharedString::from(error_message.clone()),
+                                )));
+                            }
 
-                        thread.cancel_last_completion();
+                            thread.cancel_last_completion();
+                        }
                     }
+                    cx.emit(ThreadEvent::DoneStreaming);
                 })
                 .ok();
         });
@@ -750,7 +762,13 @@ impl Thread {
 
         for tool_use in pending_tool_uses {
             if let Some(tool) = self.tools.tool(&tool_use.name, cx) {
-                let task = tool.run(tool_use.input, &request.messages, self.project.clone(), cx);
+                let task = tool.run(
+                    tool_use.input,
+                    &request.messages,
+                    self.project.clone(),
+                    self.action_log.clone(),
+                    cx,
+                );
 
                 self.insert_tool_output(tool_use.id.clone(), task, cx);
             }
@@ -857,8 +875,15 @@ impl Thread {
     pub fn send_tool_results_to_model(
         &mut self,
         model: Arc<dyn LanguageModel>,
+        updated_context: Vec<ContextSnapshot>,
         cx: &mut Context<Self>,
     ) {
+        self.context.extend(
+            updated_context
+                .into_iter()
+                .map(|context| (context.id, context)),
+        );
+
         // Insert a user message to contain the tool results.
         self.insert_user_message(
             // TODO: Sending up a user message without any content results in the model sending back
@@ -1057,6 +1082,10 @@ impl Thread {
         Ok(String::from_utf8_lossy(&markdown).to_string())
     }
 
+    pub fn action_log(&self) -> &Entity<ActionLog> {
+        &self.action_log
+    }
+
     pub fn cumulative_token_usage(&self) -> TokenUsage {
         self.cumulative_token_usage.clone()
     }
@@ -1074,6 +1103,7 @@ pub enum ThreadEvent {
     ShowError(ThreadError),
     StreamedCompletion,
     StreamedAssistantText(MessageId, String),
+    DoneStreaming,
     MessageAdded(MessageId),
     MessageEdited(MessageId),
     MessageDeleted(MessageId),
