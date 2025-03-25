@@ -633,6 +633,8 @@
         "name": "Code Writer",
         "tools": {
           "bash": true,
+          "copy-path": true,
+          "create-file": true,
           "delete-path": true,
           "diagnostics": true,
           "edit-files": true,
@@ -1254,6 +1256,14 @@
     "JSONC": {
       "prettier": {
         "allowed": true
+      }
+    },
+    "LaTeX": {
+      "format_on_save": "on",
+      "formatter": "language_server",
+      "language_servers": ["texlab", "..."],
+      "prettier": {
+        "allowed": false
       }
     },
     "Markdown": {
