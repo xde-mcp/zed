@@ -1,3 +1,7 @@
+mod add_context_server_modal;
+mod manage_profiles_modal;
+mod tool_picker;
+
 use std::sync::Arc;
 
 use assistant_tool::{ToolSource, ToolWorkingSet};
@@ -5,11 +9,14 @@ use collections::HashMap;
 use context_server::manager::ContextServerManager;
 use gpui::{Action, AnyView, App, Entity, EventEmitter, FocusHandle, Focusable, Subscription};
 use language_model::{LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry};
-use ui::{
-    prelude::*, Disclosure, Divider, DividerColor, ElevationIndex, Indicator, Switch, Tooltip,
-};
+use ui::{prelude::*, Disclosure, Divider, DividerColor, ElevationIndex, Indicator, Switch};
 use util::ResultExt as _;
 use zed_actions::ExtensionCategoryFilter;
+
+pub(crate) use add_context_server_modal::AddContextServerModal;
+pub(crate) use manage_profiles_modal::ManageProfilesModal;
+
+use crate::AddContextServer;
 
 pub struct AssistantConfiguration {
     focus_handle: FocusHandle,
@@ -307,8 +314,9 @@ impl AssistantConfiguration {
                                 .icon(IconName::Plus)
                                 .icon_size(IconSize::Small)
                                 .icon_position(IconPosition::Start)
-                                .disabled(true)
-                                .tooltip(Tooltip::text("Not yet implemented")),
+                                .on_click(|_event, window, cx| {
+                                    window.dispatch_action(AddContextServer.boxed_clone(), cx)
+                                }),
                         ),
                     )
                     .child(
