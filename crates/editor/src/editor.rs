@@ -147,7 +147,7 @@ use multi_buffer::{
 };
 use parking_lot::Mutex;
 use project::{
-    debugger::breakpoint_store::{Breakpoint, BreakpointKind},
+    debugger::breakpoint_store::Breakpoint,
     lsp_store::{CompletionDocumentation, FormatTrigger, LspFormatTarget, OpenLspBufferHandle},
     project_settings::{GitGutterSetting, ProjectSettings},
     CodeAction, Completion, CompletionIntent, CompletionSource, DocumentHighlight, InlayHint,
@@ -785,11 +785,11 @@ pub struct Editor {
     expect_bounds_change: Option<Bounds<Pixels>>,
     tasks: BTreeMap<(BufferId, BufferRow), RunnableTasks>,
     tasks_update_task: Option<Task<()>>,
-    pub breakpoint_store: Option<Entity<BreakpointStore>>,
+    breakpoint_store: Option<Entity<BreakpointStore>>,
     /// Allow's a user to create a breakpoint by selecting this indicator
     /// It should be None while a user is not hovering over the gutter
     /// Otherwise it represents the point that the breakpoint will be shown
-    pub gutter_breakpoint_indicator: Option<DisplayPoint>,
+    gutter_breakpoint_indicator: (Option<(DisplayPoint, bool)>, Option<Task<()>>),
     in_project_search: bool,
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
@@ -1549,7 +1549,7 @@ impl Editor {
             tasks: Default::default(),
 
             breakpoint_store,
-            gutter_breakpoint_indicator: None,
+            gutter_breakpoint_indicator: (None, None),
             _subscriptions: vec![
                 cx.observe(&buffer, Self::on_buffer_changed),
                 cx.subscribe_in(&buffer, window, Self::on_buffer_event),
@@ -4850,6 +4850,7 @@ impl Editor {
             } else {
                 return None;
             };
+
         let action_ix = action.item_ix.unwrap_or(actions_menu.selected_item);
         let action = actions_menu.actions.get(action_ix)?;
         let title = action.label();
@@ -4858,17 +4859,48 @@ impl Editor {
 
         match action {
             CodeActionsItem::Task(task_source_kind, resolved_task) => {
-                workspace.update(cx, |workspace, cx| {
-                    workspace::tasks::schedule_resolved_task(
-                        workspace,
-                        task_source_kind,
-                        resolved_task,
-                        false,
-                        cx,
-                    );
+                match resolved_task.task_type() {
+                    task::TaskType::Script => workspace.update(cx, |workspace, cx| {
+                        workspace::tasks::schedule_resolved_task(
+                            workspace,
+                            task_source_kind,
+                            resolved_task,
+                            false,
+                            cx,
+                        );
 
-                    Some(Task::ready(Ok(())))
-                })
+                        Some(Task::ready(Ok(())))
+                    }),
+                    task::TaskType::Debug(debug_args) => {
+                        if debug_args.locator.is_some() {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace::tasks::schedule_resolved_task(
+                                    workspace,
+                                    task_source_kind,
+                                    resolved_task,
+                                    false,
+                                    cx,
+                                );
+                            });
+
+                            return Some(Task::ready(Ok(())));
+                        }
+
+                        if let Some(project) = self.project.as_ref() {
+                            project
+                                .update(cx, |project, cx| {
+                                    project.start_debug_session(
+                                        resolved_task.resolved_debug_adapter_config().unwrap(),
+                                        cx,
+                                    )
+                                })
+                                .detach_and_log_err(cx);
+                            Some(Task::ready(Ok(())))
+                        } else {
+                            Some(Task::ready(Ok(())))
+                        }
+                    }
+                }
             }
             CodeActionsItem::CodeAction {
                 excerpt_id,
@@ -6226,10 +6258,7 @@ impl Editor {
             .breakpoint_at_row(row, window, cx)
             .map(|(_, bp)| Arc::from(bp));
 
-        let log_breakpoint_msg = if breakpoint
-            .as_ref()
-            .is_some_and(|bp| bp.kind.log_message().is_some())
-        {
+        let log_breakpoint_msg = if breakpoint.as_ref().is_some_and(|bp| bp.message.is_some()) {
             "Edit Log Breakpoint"
         } else {
             "Set Log Breakpoint"
@@ -6249,7 +6278,7 @@ impl Editor {
         let breakpoint = breakpoint.unwrap_or_else(|| {
             Arc::new(Breakpoint {
                 state: BreakpointState::Enabled,
-                kind: BreakpointKind::Standard,
+                message: None,
             })
         });
 
@@ -6308,16 +6337,17 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> IconButton {
         let (color, icon) = {
-            let icon = match (&breakpoint.kind, breakpoint.is_disabled()) {
-                (BreakpointKind::Standard, false) => ui::IconName::DebugBreakpoint,
-                (BreakpointKind::Log(_), false) => ui::IconName::DebugLogBreakpoint,
-                (BreakpointKind::Standard, true) => ui::IconName::DebugDisabledBreakpoint,
-                (BreakpointKind::Log(_), true) => ui::IconName::DebugDisabledLogBreakpoint,
+            let icon = match (&breakpoint.message.is_some(), breakpoint.is_disabled()) {
+                (false, false) => ui::IconName::DebugBreakpoint,
+                (true, false) => ui::IconName::DebugLogBreakpoint,
+                (false, true) => ui::IconName::DebugDisabledBreakpoint,
+                (true, true) => ui::IconName::DebugDisabledLogBreakpoint,
             };
 
             let color = if self
                 .gutter_breakpoint_indicator
-                .is_some_and(|point| point.row() == row)
+                .0
+                .is_some_and(|(point, is_visible)| is_visible && point.row() == row)
             {
                 Color::Hint
             } else {
@@ -8602,7 +8632,7 @@ impl Editor {
         let line_len = snapshot.buffer_snapshot.line_len(MultiBufferRow(row));
         let anchor_end = snapshot
             .buffer_snapshot
-            .anchor_before(Point::new(row, line_len));
+            .anchor_after(Point::new(row, line_len));
 
         let bp = self
             .breakpoint_store
@@ -8654,7 +8684,7 @@ impl Editor {
                 (
                     breakpoint_position,
                     Breakpoint {
-                        kind: BreakpointKind::Standard,
+                        message: None,
                         state: BreakpointState::Enabled,
                     },
                 )
@@ -19758,8 +19788,8 @@ impl BreakpointPromptEditor {
         let buffer = cx.new(|cx| {
             Buffer::local(
                 breakpoint
-                    .kind
-                    .log_message()
+                    .message
+                    .as_ref()
                     .map(|msg| msg.to_string())
                     .unwrap_or_default(),
                 cx,
