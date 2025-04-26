@@ -1,7 +1,7 @@
 use crate::schema::json_schema_for;
 use anyhow::{Context as _, Result, anyhow};
-use assistant_tool::{ActionLog, Tool};
-use gpui::{App, AppContext, Entity, Task};
+use assistant_tool::{ActionLog, Tool, ToolResult};
+use gpui::{AnyWindowHandle, App, AppContext, Entity, Task};
 use language_model::{LanguageModelRequestMessage, LanguageModelToolSchemaFormat};
 use project::Project;
 use schemars::JsonSchema;
@@ -23,7 +23,7 @@ impl Tool for OpenTool {
         "open".to_string()
     }
 
-    fn needs_confirmation(&self) -> bool {
+    fn needs_confirmation(&self, _: &serde_json::Value, _: &App) -> bool {
         true
     }
 
@@ -35,7 +35,7 @@ impl Tool for OpenTool {
         IconName::ArrowUpRight
     }
 
-    fn input_schema(&self, format: LanguageModelToolSchemaFormat) -> serde_json::Value {
+    fn input_schema(&self, format: LanguageModelToolSchemaFormat) -> Result<serde_json::Value> {
         json_schema_for::<OpenToolInput>(format)
     }
 
@@ -52,11 +52,12 @@ impl Tool for OpenTool {
         _messages: &[LanguageModelRequestMessage],
         _project: Entity<Project>,
         _action_log: Entity<ActionLog>,
+        _window: Option<AnyWindowHandle>,
         cx: &mut App,
-    ) -> Task<Result<String>> {
+    ) -> ToolResult {
         let input: OpenToolInput = match serde_json::from_value(input) {
             Ok(input) => input,
-            Err(err) => return Task::ready(Err(anyhow!(err))),
+            Err(err) => return Task::ready(Err(anyhow!(err))).into(),
         };
 
         cx.background_spawn(async move {
@@ -64,5 +65,6 @@ impl Tool for OpenTool {
 
             Ok(format!("Successfully opened {}", input.path_or_url))
         })
+        .into()
     }
 }

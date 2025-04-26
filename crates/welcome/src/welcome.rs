@@ -12,6 +12,7 @@ use language::language_settings::{EditPredictionProvider, all_language_settings}
 use settings::{Settings, SettingsStore};
 use std::sync::Arc;
 use ui::{CheckboxWithLabel, ElevationIndex, Tooltip, prelude::*};
+use util::ResultExt;
 use vim_mode_setting::VimModeSetting;
 use workspace::{
     AppState, Welcome, Workspace, WorkspaceId,
@@ -200,7 +201,8 @@ impl Render for WelcomePage {
                                                     zed_actions::OpenSettings,
                                                 ), cx);
                                             })),
-                                    ),
+                                    )
+
                             )
                             .child(
                                 v_flex()
@@ -219,13 +221,11 @@ impl Render for WelcomePage {
                                                 .icon_size(IconSize::XSmall)
                                                 .icon_color(Color::Muted)
                                                 .icon_position(IconPosition::Start)
-                                                .on_click(cx.listener(|_, _, _, cx| {
+                                                .on_click(cx.listener(|this, _, window, cx| {
                                                     telemetry::event!("Welcome CLI Installed");
-                                                    cx
-                                                        .spawn(async move |_, cx| {
-                                                            install_cli::install_cli(&cx).await
-                                                        })
-                                                        .detach_and_log_err(cx);
+                                                    this.workspace.update(cx, |_, cx|{
+                                                        install_cli::install_cli(window, cx);
+                                                    }).log_err();
                                                 })),
                                         )
                                     })
@@ -267,6 +267,7 @@ impl Render for WelcomePage {
                     )
                     .child(
                         v_container()
+                            .px_2()
                             .gap_2()
                             .child(
                                 h_flex()
