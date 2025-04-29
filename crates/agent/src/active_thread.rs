@@ -1,4 +1,4 @@
-use crate::context::{AgentContext, RULES_ICON};
+use crate::context::{AgentContextHandle, RULES_ICON};
 use crate::context_picker::MentionLink;
 use crate::thread::{
     LastRestoreCheckpoint, MessageId, MessageSegment, Thread, ThreadError, ThreadEvent,
@@ -25,8 +25,8 @@ use gpui::{
 };
 use language::{Buffer, LanguageRegistry};
 use language_model::{
-    LanguageModelRegistry, LanguageModelRequestMessage, LanguageModelToolUseId, MessageContent,
-    RequestUsage, Role, StopReason,
+    LanguageModelRequestMessage, LanguageModelToolUseId, MessageContent, RequestUsage, Role,
+    StopReason,
 };
 use markdown::parser::{CodeBlockKind, CodeBlockMetadata};
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownStyle, ParsedMarkdown};
@@ -903,6 +903,11 @@ impl ActiveThread {
         cx: &mut Context<Self>,
     ) {
         match event {
+            ThreadEvent::CancelEditing => {
+                if self.editing_message.is_some() {
+                    self.cancel_editing_message(&menu::Cancel, window, cx);
+                }
+            }
             ThreadEvent::ShowError(error) => {
                 self.last_error = Some(error.clone());
             }
@@ -1247,7 +1252,7 @@ impl ActiveThread {
         cx.emit(ActiveThreadEvent::EditingMessageTokenCountChanged);
         state._update_token_count_task.take();
 
-        let Some(default_model) = LanguageModelRegistry::read_global(cx).default_model() else {
+        let Some(configured_model) = self.thread.read(cx).configured_model() else {
             state.last_estimated_token_count.take();
             return;
         };
@@ -1293,13 +1298,14 @@ impl ActiveThread {
                 let request = language_model::LanguageModelRequest {
                     thread_id: None,
                     prompt_id: None,
+                    mode: None,
                     messages: vec![request_message],
                     tools: vec![],
                     stop: vec![],
                     temperature: None,
                 };
 
-                Some(default_model.model.count_tokens(request, cx))
+                Some(configured_model.model.count_tokens(request, cx))
             })? {
                 task.await?
             } else {
@@ -1332,7 +1338,7 @@ impl ActiveThread {
             return;
         };
         let edited_text = state.editor.read(cx).text(cx);
-        self.thread.update(cx, |thread, cx| {
+        let thread_model = self.thread.update(cx, |thread, cx| {
             thread.edit_message(
                 message_id,
                 Role::User,
@@ -1342,9 +1348,10 @@ impl ActiveThread {
             for message_id in self.messages_after(message_id) {
                 thread.delete_message(*message_id, cx);
             }
+            thread.get_or_init_configured_model(cx)
         });
 
-        let Some(model) = LanguageModelRegistry::read_global(cx).default_model() else {
+        let Some(model) = thread_model else {
             return;
         };
 
@@ -1490,19 +1497,13 @@ impl ActiveThread {
 
         let workspace = self.workspace.clone();
         let thread = self.thread.read(cx);
-        let prompt_store = self.thread_store.read(cx).prompt_store().as_ref();
 
         // Get all the data we need from thread before we start using it in closures
         let checkpoint = thread.checkpoint_for_message(message_id);
-        let added_context = if let Some(workspace) = workspace.upgrade() {
-            let project = workspace.read(cx).project().read(cx);
-            thread
-                .context_for_message(message_id)
-                .flat_map(|context| AddedContext::new(context.clone(), prompt_store, project, cx))
-                .collect::<Vec<_>>()
-        } else {
-            return Empty.into_any();
-        };
+        let added_context = thread
+            .context_for_message(message_id)
+            .map(|context| AddedContext::new_attached(context, cx))
+            .collect::<Vec<_>>();
 
         let tool_uses = thread.tool_uses_for_message(message_id, cx);
         let has_tool_uses = !tool_uses.is_empty();
@@ -1712,7 +1713,7 @@ impl ActiveThread {
                 .when(!added_context.is_empty(), |parent| {
                     parent.child(h_flex().flex_wrap().gap_1().children(
                         added_context.into_iter().map(|added_context| {
-                            let context = added_context.context.clone();
+                            let context = added_context.handle.clone();
                             ContextPill::added(added_context, false, false, None).on_click(Rc::new(
                                 cx.listener({
                                     let workspace = workspace.clone();
@@ -3187,13 +3188,13 @@ impl Render for ActiveThread {
 }
 
 pub(crate) fn open_context(
-    context: &AgentContext,
+    context: &AgentContextHandle,
     workspace: Entity<Workspace>,
     window: &mut Window,
     cx: &mut App,
 ) {
     match context {
-        AgentContext::File(file_context) => {
+        AgentContextHandle::File(file_context) => {
             if let Some(project_path) = file_context.project_path(cx) {
                 workspace.update(cx, |workspace, cx| {
                     workspace
@@ -3203,7 +3204,7 @@ pub(crate) fn open_context(
             }
         }
 
-        AgentContext::Directory(directory_context) => {
+        AgentContextHandle::Directory(directory_context) => {
             let entry_id = directory_context.entry_id;
             workspace.update(cx, |workspace, cx| {
                 workspace.project().update(cx, |_project, cx| {
@@ -3212,7 +3213,7 @@ pub(crate) fn open_context(
             })
         }
 
-        AgentContext::Symbol(symbol_context) => {
+        AgentContextHandle::Symbol(symbol_context) => {
             let buffer = symbol_context.buffer.read(cx);
             if let Some(project_path) = buffer.project_path(cx) {
                 let snapshot = buffer.snapshot();
@@ -3222,7 +3223,7 @@ pub(crate) fn open_context(
             }
         }
 
-        AgentContext::Selection(selection_context) => {
+        AgentContextHandle::Selection(selection_context) => {
             let buffer = selection_context.buffer.read(cx);
             if let Some(project_path) = buffer.project_path(cx) {
                 let snapshot = buffer.snapshot();
@@ -3233,11 +3234,11 @@ pub(crate) fn open_context(
             }
         }
 
-        AgentContext::FetchedUrl(fetched_url_context) => {
+        AgentContextHandle::FetchedUrl(fetched_url_context) => {
             cx.open_url(&fetched_url_context.url);
         }
 
-        AgentContext::Thread(thread_context) => workspace.update(cx, |workspace, cx| {
+        AgentContextHandle::Thread(thread_context) => workspace.update(cx, |workspace, cx| {
             if let Some(panel) = workspace.panel::<AssistantPanel>(cx) {
                 panel.update(cx, |panel, cx| {
                     let thread_id = thread_context.thread.read(cx).id().clone();
@@ -3248,14 +3249,14 @@ pub(crate) fn open_context(
             }
         }),
 
-        AgentContext::Rules(rules_context) => window.dispatch_action(
+        AgentContextHandle::Rules(rules_context) => window.dispatch_action(
             Box::new(OpenRulesLibrary {
                 prompt_to_select: Some(rules_context.prompt_id.0),
             }),
             cx,
         ),
 
-        AgentContext::Image(_) => {}
+        AgentContextHandle::Image(_) => {}
     }
 }
 
