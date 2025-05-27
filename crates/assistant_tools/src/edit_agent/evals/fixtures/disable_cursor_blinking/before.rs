@@ -7698,7 +7698,7 @@ impl Editor {
                     .gap_1()
                     // Workaround: For some reason, there's a gap if we don't do this
                     .ml(-BORDER_WIDTH)
-                    .shadow(smallvec![gpui::BoxShadow {
+                    .shadow(vec![gpui::BoxShadow {
                         color: gpui::black().opacity(0.05),
                         offset: point(px(1.), px(1.)),
                         blur_radius: px(2.),
@@ -19812,7 +19812,7 @@ impl SemanticsProvider for Entity<Project> {
                     PrepareRenameResponse::InvalidPosition => None,
                     PrepareRenameResponse::OnlyUnpreparedRenameSupported => {
                         // Fallback on using TreeSitter info to determine identifier range
-                        buffer.update(cx, |buffer, _| {
+                        buffer.read_with(cx, |buffer, _| {
                             let snapshot = buffer.snapshot();
                             let (range, kind) = snapshot.surrounding_word(position);
                             if kind != Some(CharKind::Word) {
