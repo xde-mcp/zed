@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use stripe::{
     CancellationDetails, CancellationDetailsReason, CheckoutSession, CheckoutSessionMode,
     CheckoutSessionPaymentMethodCollection, CreateCheckoutSession, CreateCheckoutSessionLineItems,
@@ -11,7 +11,7 @@ use stripe::{
     CreateCheckoutSessionSubscriptionDataTrialSettingsEndBehavior,
     CreateCheckoutSessionSubscriptionDataTrialSettingsEndBehaviorMissingPaymentMethod,
     CreateCustomer, Customer, CustomerId, ListCustomers, Price, PriceId, Recurring, Subscription,
-    SubscriptionId, SubscriptionItem, SubscriptionItemId, UpdateSubscriptionItems,
+    SubscriptionId, SubscriptionItem, SubscriptionItemId, UpdateCustomer, UpdateSubscriptionItems,
     UpdateSubscriptionTrialSettings, UpdateSubscriptionTrialSettingsEndBehavior,
     UpdateSubscriptionTrialSettingsEndBehaviorMissingPaymentMethod,
 };
@@ -25,7 +25,8 @@ use crate::stripe_client::{
     StripePriceId, StripePriceRecurring, StripeSubscription, StripeSubscriptionId,
     StripeSubscriptionItem, StripeSubscriptionItemId, StripeSubscriptionTrialSettings,
     StripeSubscriptionTrialSettingsEndBehavior,
-    StripeSubscriptionTrialSettingsEndBehaviorMissingPaymentMethod, UpdateSubscriptionParams,
+    StripeSubscriptionTrialSettingsEndBehaviorMissingPaymentMethod, UpdateCustomerParams,
+    UpdateSubscriptionParams,
 };
 
 pub struct RealStripeClient {
@@ -69,6 +70,24 @@ impl StripeClient for RealStripeClient {
         let customer = Customer::create(
             &self.client,
             CreateCustomer {
+                email: params.email,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        Ok(StripeCustomer::from(customer))
+    }
+
+    async fn update_customer(
+        &self,
+        customer_id: &StripeCustomerId,
+        params: UpdateCustomerParams<'_>,
+    ) -> Result<StripeCustomer> {
+        let customer = Customer::update(
+            &self.client,
+            &customer_id.try_into()?,
+            UpdateCustomer {
                 email: params.email,
                 ..Default::default()
             },
@@ -213,9 +232,18 @@ impl StripeClient for RealStripeClient {
     }
 
     async fn create_meter_event(&self, params: StripeCreateMeterEventParams<'_>) -> Result<()> {
+        #[derive(Deserialize)]
+        struct StripeMeterEvent {
+            pub identifier: String,
+        }
+
         let identifier = params.identifier;
-        match self.client.post_form("/billing/meter_events", params).await {
-            Ok(event) => Ok(event),
+        match self
+            .client
+            .post_form::<StripeMeterEvent, _>("/billing/meter_events", params)
+            .await
+        {
+            Ok(_event) => Ok(()),
             Err(stripe::StripeError::Stripe(error)) => {
                 if error.http_status == 400
                     && error
@@ -228,7 +256,7 @@ impl StripeClient for RealStripeClient {
                     Err(anyhow!(stripe::StripeError::Stripe(error)))
                 }
             }
-            Err(error) => Err(anyhow!(error)),
+            Err(error) => Err(anyhow!("failed to create meter event: {error:?}")),
         }
     }
 
