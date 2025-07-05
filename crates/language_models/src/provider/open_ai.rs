@@ -28,16 +28,16 @@ use ui::{ElevationIndex, List, Tooltip, prelude::*};
 use ui_input::SingleLineInput;
 use util::ResultExt;
 
+use crate::OpenAiSettingsContent;
 use crate::{AllLanguageModelSettings, ui::InstructionListItem};
 
-const PROVIDER_ID: &str = "openai";
-const PROVIDER_NAME: &str = "OpenAI";
+const PROVIDER_ID: LanguageModelProviderId = language_model::OPEN_AI_PROVIDER_ID;
+const PROVIDER_NAME: LanguageModelProviderName = language_model::OPEN_AI_PROVIDER_NAME;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
-    pub needs_setting_migration: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -173,11 +173,11 @@ impl LanguageModelProviderState for OpenAiLanguageModelProvider {
 
 impl LanguageModelProvider for OpenAiLanguageModelProvider {
     fn id(&self) -> LanguageModelProviderId {
-        LanguageModelProviderId(PROVIDER_ID.into())
+        PROVIDER_ID
     }
 
     fn name(&self) -> LanguageModelProviderName {
-        LanguageModelProviderName(PROVIDER_NAME.into())
+        PROVIDER_NAME
     }
 
     fn icon(&self) -> IconName {
@@ -267,7 +267,11 @@ impl OpenAiLanguageModel {
         };
 
         let future = self.request_limiter.stream(async move {
-            let api_key = api_key.context("Missing OpenAI API Key")?;
+            let Some(api_key) = api_key else {
+                return Err(LanguageModelCompletionError::NoApiKey {
+                    provider: PROVIDER_NAME,
+                });
+            };
             let request = stream_completion(http_client.as_ref(), &api_url, &api_key, request);
             let response = request.await?;
             Ok(response)
@@ -287,11 +291,11 @@ impl LanguageModel for OpenAiLanguageModel {
     }
 
     fn provider_id(&self) -> LanguageModelProviderId {
-        LanguageModelProviderId(PROVIDER_ID.into())
+        PROVIDER_ID
     }
 
     fn provider_name(&self) -> LanguageModelProviderName {
-        LanguageModelProviderName(PROVIDER_NAME.into())
+        PROVIDER_NAME
     }
 
     fn supports_tools(&self) -> bool {
@@ -525,7 +529,7 @@ impl OpenAiEventMapper {
         events.flat_map(move |event| {
             futures::stream::iter(match event {
                 Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::Other(anyhow!(error)))],
+                Err(error) => vec![Err(LanguageModelCompletionError::from(anyhow!(error)))],
             })
         })
     }
@@ -588,10 +592,10 @@ impl OpenAiEventMapper {
                                 raw_input: tool_call.arguments.clone(),
                             },
                         )),
-                        Err(error) => Err(LanguageModelCompletionError::BadInputJson {
+                        Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
                             id: tool_call.id.into(),
-                            tool_name: tool_call.name.as_str().into(),
-                            raw_input: tool_call.arguments.into(),
+                            tool_name: tool_call.name.into(),
+                            raw_input: tool_call.arguments.clone().into(),
                             json_parse_error: error.to_string(),
                         }),
                     }
@@ -803,30 +807,13 @@ impl ConfigurationView {
         if !api_url.is_empty() && api_url != effective_current_url {
             let fs = <dyn Fs>::global(cx);
             update_settings_file::<AllLanguageModelSettings>(fs, cx, move |settings, _| {
-                use crate::settings::{OpenAiSettingsContent, VersionedOpenAiSettingsContent};
-
-                if settings.openai.is_none() {
-                    settings.openai = Some(OpenAiSettingsContent::Versioned(
-                        VersionedOpenAiSettingsContent::V1(
-                            crate::settings::OpenAiSettingsContentV1 {
-                                api_url: Some(api_url.clone()),
-                                available_models: None,
-                            },
-                        ),
-                    ));
+                if let Some(settings) = settings.openai.as_mut() {
+                    settings.api_url = Some(api_url.clone());
                 } else {
-                    if let Some(openai) = settings.openai.as_mut() {
-                        match openai {
-                            OpenAiSettingsContent::Versioned(versioned) => match versioned {
-                                VersionedOpenAiSettingsContent::V1(v1) => {
-                                    v1.api_url = Some(api_url.clone());
-                                }
-                            },
-                            OpenAiSettingsContent::Legacy(legacy) => {
-                                legacy.api_url = Some(api_url.clone());
-                            }
-                        }
-                    }
+                    settings.openai = Some(OpenAiSettingsContent {
+                        api_url: Some(api_url.clone()),
+                        available_models: None,
+                    });
                 }
             });
         }
@@ -840,19 +827,8 @@ impl ConfigurationView {
         });
         let fs = <dyn Fs>::global(cx);
         update_settings_file::<AllLanguageModelSettings>(fs, cx, |settings, _cx| {
-            use crate::settings::{OpenAiSettingsContent, VersionedOpenAiSettingsContent};
-
-            if let Some(openai) = settings.openai.as_mut() {
-                match openai {
-                    OpenAiSettingsContent::Versioned(versioned) => match versioned {
-                        VersionedOpenAiSettingsContent::V1(v1) => {
-                            v1.api_url = None;
-                        }
-                    },
-                    OpenAiSettingsContent::Legacy(legacy) => {
-                        legacy.api_url = None;
-                    }
-                }
+            if let Some(settings) = settings.openai.as_mut() {
+                settings.api_url = None;
             }
         });
         cx.notify();

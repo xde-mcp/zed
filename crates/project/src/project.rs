@@ -81,7 +81,7 @@ use language::{
 };
 use lsp::{
     CodeActionKind, CompletionContext, CompletionItemKind, DocumentHighlightKind, InsertTextMode,
-    LanguageServerId, LanguageServerName, MessageActionItem,
+    LanguageServerId, LanguageServerName, LanguageServerSelector, MessageActionItem,
 };
 use lsp_command::*;
 use lsp_store::{CompletionDocumentation, LspFormatTarget, OpenLspBufferHandle};
@@ -131,7 +131,8 @@ pub use language::Location;
 #[cfg(any(test, feature = "test-support"))]
 pub use prettier::FORMAT_SUFFIX as TEST_PRETTIER_FORMAT_SUFFIX;
 pub use task_inventory::{
-    BasicContextProvider, ContextProviderWithTasks, Inventory, TaskContexts, TaskSourceKind,
+    BasicContextProvider, ContextProviderWithTasks, DebugScenarioContext, Inventory, TaskContexts,
+    TaskSourceKind,
 };
 
 pub use buffer_store::ProjectTransaction;
@@ -251,6 +252,7 @@ enum BufferOrderedMessage {
     LanguageServerUpdate {
         language_server_id: LanguageServerId,
         message: proto::update_language_server::Variant,
+        name: Option<LanguageServerName>,
     },
     Resync,
 }
@@ -694,7 +696,7 @@ pub struct MarkupContent {
     pub value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LocationLink {
     pub origin: Option<Location>,
     pub target: Location,
@@ -778,11 +780,40 @@ pub struct DocumentColor {
     pub color_presentations: Vec<ColorPresentation>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl Eq for DocumentColor {}
+
+impl std::hash::Hash for DocumentColor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.lsp_range.hash(state);
+        self.color.red.to_bits().hash(state);
+        self.color.green.to_bits().hash(state);
+        self.color.blue.to_bits().hash(state);
+        self.color.alpha.to_bits().hash(state);
+        self.resolved.hash(state);
+        self.color_presentations.hash(state);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColorPresentation {
-    pub label: String,
+    pub label: SharedString,
     pub text_edit: Option<lsp::TextEdit>,
     pub additional_text_edits: Vec<lsp::TextEdit>,
+}
+
+impl std::hash::Hash for ColorPresentation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.label.hash(state);
+        if let Some(ref edit) = self.text_edit {
+            edit.range.hash(state);
+            edit.new_text.hash(state);
+        }
+        self.additional_text_edits.len().hash(state);
+        for edit in &self.additional_text_edits {
+            edit.range.hash(state);
+            edit.new_text.hash(state);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1790,7 +1821,7 @@ impl Project {
     pub fn has_open_buffer(&self, path: impl Into<ProjectPath>, cx: &App) -> bool {
         self.buffer_store
             .read(cx)
-            .get_by_path(&path.into(), cx)
+            .get_by_path(&path.into())
             .is_some()
     }
 
@@ -2500,7 +2531,7 @@ impl Project {
         cx: &mut App,
     ) -> OpenLspBufferHandle {
         self.lsp_store.update(cx, |lsp_store, cx| {
-            lsp_store.register_buffer_with_language_servers(&buffer, false, cx)
+            lsp_store.register_buffer_with_language_servers(&buffer, HashSet::default(), false, cx)
         })
     }
 
@@ -2590,7 +2621,7 @@ impl Project {
     }
 
     pub fn get_open_buffer(&self, path: &ProjectPath, cx: &App) -> Option<Entity<Buffer>> {
-        self.buffer_store.read(cx).get_by_path(path, cx)
+        self.buffer_store.read(cx).get_by_path(path)
     }
 
     fn register_buffer(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) -> Result<()> {
@@ -2640,7 +2671,7 @@ impl Project {
     }
 
     async fn send_buffer_ordered_messages(
-        this: WeakEntity<Self>,
+        project: WeakEntity<Self>,
         rx: UnboundedReceiver<BufferOrderedMessage>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
@@ -2677,7 +2708,7 @@ impl Project {
         let mut changes = rx.ready_chunks(MAX_BATCH_SIZE);
 
         while let Some(changes) = changes.next().await {
-            let is_local = this.read_with(cx, |this, _| this.is_local())?;
+            let is_local = project.read_with(cx, |this, _| this.is_local())?;
 
             for change in changes {
                 match change {
@@ -2697,7 +2728,7 @@ impl Project {
 
                     BufferOrderedMessage::Resync => {
                         operations_by_buffer_id.clear();
-                        if this
+                        if project
                             .update(cx, |this, cx| this.synchronize_remote_buffers(cx))?
                             .await
                             .is_ok()
@@ -2709,9 +2740,10 @@ impl Project {
                     BufferOrderedMessage::LanguageServerUpdate {
                         language_server_id,
                         message,
+                        name,
                     } => {
                         flush_operations(
-                            &this,
+                            &project,
                             &mut operations_by_buffer_id,
                             &mut needs_resync_with_host,
                             is_local,
@@ -2719,12 +2751,14 @@ impl Project {
                         )
                         .await?;
 
-                        this.read_with(cx, |this, _| {
-                            if let Some(project_id) = this.remote_id() {
-                                this.client
+                        project.read_with(cx, |project, _| {
+                            if let Some(project_id) = project.remote_id() {
+                                project
+                                    .client
                                     .send(proto::UpdateLanguageServer {
                                         project_id,
-                                        language_server_id: language_server_id.0 as u64,
+                                        server_name: name.map(|name| String::from(name.0)),
+                                        language_server_id: language_server_id.to_proto(),
                                         variant: Some(message),
                                     })
                                     .log_err();
@@ -2735,7 +2769,7 @@ impl Project {
             }
 
             flush_operations(
-                &this,
+                &project,
                 &mut operations_by_buffer_id,
                 &mut needs_resync_with_host,
                 is_local,
@@ -2856,12 +2890,14 @@ impl Project {
             LspStoreEvent::LanguageServerUpdate {
                 language_server_id,
                 message,
+                name,
             } => {
                 if self.is_local() {
                     self.enqueue_buffer_ordered_message(
                         BufferOrderedMessage::LanguageServerUpdate {
                             language_server_id: *language_server_id,
                             message: message.clone(),
+                            name: name.clone(),
                         },
                     )
                     .ok();
@@ -2937,6 +2973,20 @@ impl Project {
                 }
                 Ok(path) => cx.emit(Event::HideToast {
                     notification_id: format!("local-tasks-{path:?}").into(),
+                }),
+                Err(_) => {}
+            },
+            SettingsObserverEvent::LocalDebugScenariosUpdated(result) => match result {
+                Err(InvalidSettingsError::Debug { message, path }) => {
+                    let message =
+                        format!("Failed to set local debug scenarios in {path:?}:\n{message}");
+                    cx.emit(Event::Toast {
+                        notification_id: format!("local-debug-scenarios-{path:?}").into(),
+                        message,
+                    });
+                }
+                Ok(path) => cx.emit(Event::HideToast {
+                    notification_id: format!("local-debug-scenarios-{path:?}").into(),
                 }),
                 Err(_) => {}
             },
@@ -3140,20 +3190,22 @@ impl Project {
     pub fn restart_language_servers_for_buffers(
         &mut self,
         buffers: Vec<Entity<Buffer>>,
+        only_restart_servers: HashSet<LanguageServerSelector>,
         cx: &mut Context<Self>,
     ) {
         self.lsp_store.update(cx, |lsp_store, cx| {
-            lsp_store.restart_language_servers_for_buffers(buffers, cx)
+            lsp_store.restart_language_servers_for_buffers(buffers, only_restart_servers, cx)
         })
     }
 
     pub fn stop_language_servers_for_buffers(
         &mut self,
         buffers: Vec<Entity<Buffer>>,
+        also_restart_servers: HashSet<LanguageServerSelector>,
         cx: &mut Context<Self>,
     ) {
         self.lsp_store.update(cx, |lsp_store, cx| {
-            lsp_store.stop_language_servers_for_buffers(buffers, cx)
+            lsp_store.stop_language_servers_for_buffers(buffers, also_restart_servers, cx)
         })
     }
 
@@ -3290,91 +3342,52 @@ impl Project {
         })
     }
 
-    #[inline(never)]
-    fn definition_impl(
-        &mut self,
-        buffer: &Entity<Buffer>,
-        position: PointUtf16,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<Vec<LocationLink>>> {
-        self.request_lsp(
-            buffer.clone(),
-            LanguageServerToQuery::FirstCapable,
-            GetDefinition { position },
-            cx,
-        )
-    }
-    pub fn definition<T: ToPointUtf16>(
+    pub fn definitions<T: ToPointUtf16>(
         &mut self,
         buffer: &Entity<Buffer>,
         position: T,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<LocationLink>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.definition_impl(buffer, position, cx)
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.definitions(buffer, position, cx)
+        })
     }
 
-    fn declaration_impl(
-        &mut self,
-        buffer: &Entity<Buffer>,
-        position: PointUtf16,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<Vec<LocationLink>>> {
-        self.request_lsp(
-            buffer.clone(),
-            LanguageServerToQuery::FirstCapable,
-            GetDeclaration { position },
-            cx,
-        )
-    }
-
-    pub fn declaration<T: ToPointUtf16>(
+    pub fn declarations<T: ToPointUtf16>(
         &mut self,
         buffer: &Entity<Buffer>,
         position: T,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<LocationLink>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.declaration_impl(buffer, position, cx)
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.declarations(buffer, position, cx)
+        })
     }
 
-    fn type_definition_impl(
-        &mut self,
-        buffer: &Entity<Buffer>,
-        position: PointUtf16,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<Vec<LocationLink>>> {
-        self.request_lsp(
-            buffer.clone(),
-            LanguageServerToQuery::FirstCapable,
-            GetTypeDefinition { position },
-            cx,
-        )
-    }
-
-    pub fn type_definition<T: ToPointUtf16>(
+    pub fn type_definitions<T: ToPointUtf16>(
         &mut self,
         buffer: &Entity<Buffer>,
         position: T,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<LocationLink>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.type_definition_impl(buffer, position, cx)
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.type_definitions(buffer, position, cx)
+        })
     }
 
-    pub fn implementation<T: ToPointUtf16>(
+    pub fn implementations<T: ToPointUtf16>(
         &mut self,
         buffer: &Entity<Buffer>,
         position: T,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<LocationLink>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.request_lsp(
-            buffer.clone(),
-            LanguageServerToQuery::FirstCapable,
-            GetImplementation { position },
-            cx,
-        )
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.implementations(buffer, position, cx)
+        })
     }
 
     pub fn references<T: ToPointUtf16>(
@@ -3384,12 +3397,9 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<Location>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.request_lsp(
-            buffer.clone(),
-            LanguageServerToQuery::FirstCapable,
-            GetReferences { position },
-            cx,
-        )
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.references(buffer, position, cx)
+        })
     }
 
     fn document_highlights_impl(
