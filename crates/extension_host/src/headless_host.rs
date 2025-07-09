@@ -1,7 +1,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
-use client::{TypedEnvelope, proto};
+use client::{
+    TypedEnvelope,
+    proto::{self, FromProto},
+};
 use collections::{HashMap, HashSet};
 use extension::{
     Extension, ExtensionDebugAdapterProviderProxy, ExtensionHostProxy, ExtensionLanguageProxy,
@@ -125,7 +128,7 @@ impl HeadlessExtensionStore {
 
         let manifest = Arc::new(ExtensionManifest::load(fs.clone(), &extension_dir).await?);
 
-        debug_assert!(!manifest.languages.is_empty() || !manifest.language_servers.is_empty());
+        debug_assert!(!manifest.languages.is_empty() || manifest.allow_remote_load());
 
         if manifest.version.as_ref() != extension.version.as_str() {
             anyhow::bail!(
@@ -165,7 +168,7 @@ impl HeadlessExtensionStore {
             })?;
         }
 
-        if manifest.language_servers.is_empty() {
+        if !manifest.allow_remote_load() {
             return Ok(());
         }
 
@@ -187,24 +190,28 @@ impl HeadlessExtensionStore {
                     );
                 })?;
             }
-            for (debug_adapter, meta) in &manifest.debug_adapters {
-                let schema_path = extension::build_debug_adapter_schema_path(debug_adapter, meta);
+            log::info!("Loaded language server: {}", language_server_id);
+        }
 
-                this.update(cx, |this, _cx| {
-                    this.proxy.register_debug_adapter(
-                        wasm_extension.clone(),
-                        debug_adapter.clone(),
-                        &extension_dir.join(schema_path),
-                    );
-                })?;
-            }
+        for (debug_adapter, meta) in &manifest.debug_adapters {
+            let schema_path = extension::build_debug_adapter_schema_path(debug_adapter, meta);
 
-            for debug_adapter in manifest.debug_locators.keys() {
-                this.update(cx, |this, _cx| {
-                    this.proxy
-                        .register_debug_locator(wasm_extension.clone(), debug_adapter.clone());
-                })?;
-            }
+            this.update(cx, |this, _cx| {
+                this.proxy.register_debug_adapter(
+                    wasm_extension.clone(),
+                    debug_adapter.clone(),
+                    &extension_dir.join(schema_path),
+                );
+            })?;
+            log::info!("Loaded debug adapter: {}", debug_adapter);
+        }
+
+        for debug_locator in manifest.debug_locators.keys() {
+            this.update(cx, |this, _cx| {
+                this.proxy
+                    .register_debug_locator(wasm_extension.clone(), debug_locator.clone());
+            })?;
+            log::info!("Loaded debug locator: {}", debug_locator);
         }
 
         Ok(())
@@ -324,7 +331,7 @@ impl HeadlessExtensionStore {
                         version: extension.version,
                         dev: extension.dev,
                     },
-                    PathBuf::from(envelope.payload.tmp_dir),
+                    PathBuf::from_proto(envelope.payload.tmp_dir),
                     cx,
                 )
             })?
