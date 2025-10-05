@@ -12,10 +12,10 @@ use project::project_settings::ProjectSettings;
 use settings::{Settings as _, update_settings_file};
 use theme::{FontFamilyCache, FontFamilyName, ThemeSettings};
 use ui::{
-    ButtonLike, ListItem, ListItemSpacing, NumericStepper, PopoverMenu, SwitchField,
-    ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, ToggleState, Tooltip,
-    prelude::*,
+    ButtonLike, ListItem, ListItemSpacing, PopoverMenu, SwitchField, ToggleButtonGroup,
+    ToggleButtonGroupStyle, ToggleButtonSimple, ToggleState, Tooltip, prelude::*,
 };
+use ui_input::NumericStepper;
 
 use crate::{ImportCursorSettings, ImportVsCodeSettings, SettingsImportState};
 
@@ -34,8 +34,13 @@ fn write_show_mini_map(show: ShowMinimap, cx: &mut App) {
     curr_settings.minimap.show = show;
     EditorSettings::override_global(curr_settings, cx);
 
-    update_settings_file::<EditorSettings>(fs, cx, move |editor_settings, _| {
-        editor_settings.minimap.get_or_insert_default().show = Some(show);
+    update_settings_file(fs, cx, move |settings, _| {
+        telemetry::event!(
+            "Welcome Minimap Clicked",
+            from = settings.editor.minimap.clone().unwrap_or_default(),
+            to = show
+        );
+        settings.editor.minimap.get_or_insert_default().show = Some(show);
     });
 }
 
@@ -53,73 +58,80 @@ fn write_inlay_hints(enabled: bool, cx: &mut App) {
     curr_settings.defaults.inlay_hints.enabled = enabled;
     AllLanguageSettings::override_global(curr_settings, cx);
 
-    update_settings_file::<AllLanguageSettings>(fs, cx, move |all_language_settings, cx| {
-        all_language_settings
+    update_settings_file(fs, cx, move |settings, _cx| {
+        settings
+            .project
+            .all_languages
             .defaults
             .inlay_hints
-            .get_or_insert_with(|| {
-                AllLanguageSettings::get_global(cx)
-                    .clone()
-                    .defaults
-                    .inlay_hints
-            })
-            .enabled = enabled;
+            .get_or_insert_default()
+            .enabled = Some(enabled);
     });
 }
 
 fn read_git_blame(cx: &App) -> bool {
-    ProjectSettings::get_global(cx).git.inline_blame_enabled()
+    ProjectSettings::get_global(cx).git.inline_blame.enabled
 }
 
-fn set_git_blame(enabled: bool, cx: &mut App) {
+fn write_git_blame(enabled: bool, cx: &mut App) {
     let fs = <dyn Fs>::global(cx);
 
     let mut curr_settings = ProjectSettings::get_global(cx).clone();
-    curr_settings
-        .git
-        .inline_blame
-        .get_or_insert_default()
-        .enabled = enabled;
+    curr_settings.git.inline_blame.enabled = enabled;
     ProjectSettings::override_global(curr_settings, cx);
 
-    update_settings_file::<ProjectSettings>(fs, cx, move |project_settings, _| {
-        project_settings
+    update_settings_file(fs, cx, move |settings, _| {
+        settings
             .git
+            .get_or_insert_default()
             .inline_blame
             .get_or_insert_default()
-            .enabled = enabled;
+            .enabled = Some(enabled);
     });
 }
 
 fn write_ui_font_family(font: SharedString, cx: &mut App) {
     let fs = <dyn Fs>::global(cx);
 
-    update_settings_file::<ThemeSettings>(fs, cx, move |theme_settings, _| {
-        theme_settings.ui_font_family = Some(FontFamilyName(font.into()));
+    update_settings_file(fs, cx, move |settings, _| {
+        telemetry::event!(
+            "Welcome Font Changed",
+            type = "ui font",
+            old = settings.theme.ui_font_family,
+            new = font
+        );
+        settings.theme.ui_font_family = Some(FontFamilyName(font.into()));
     });
 }
 
 fn write_ui_font_size(size: Pixels, cx: &mut App) {
     let fs = <dyn Fs>::global(cx);
 
-    update_settings_file::<ThemeSettings>(fs, cx, move |theme_settings, _| {
-        theme_settings.ui_font_size = Some(size.into());
+    update_settings_file(fs, cx, move |settings, _| {
+        settings.theme.ui_font_size = Some(size.into());
     });
 }
 
 fn write_buffer_font_size(size: Pixels, cx: &mut App) {
     let fs = <dyn Fs>::global(cx);
 
-    update_settings_file::<ThemeSettings>(fs, cx, move |theme_settings, _| {
-        theme_settings.buffer_font_size = Some(size.into());
+    update_settings_file(fs, cx, move |settings, _| {
+        settings.theme.buffer_font_size = Some(size.into());
     });
 }
 
 fn write_buffer_font_family(font_family: SharedString, cx: &mut App) {
     let fs = <dyn Fs>::global(cx);
 
-    update_settings_file::<ThemeSettings>(fs, cx, move |theme_settings, _| {
-        theme_settings.buffer_font_family = Some(FontFamilyName(font_family.into()));
+    update_settings_file(fs, cx, move |settings, _| {
+        telemetry::event!(
+            "Welcome Font Changed",
+            type = "editor font",
+            old = settings.theme.buffer_font_family,
+            new = font_family
+        );
+
+        settings.theme.buffer_font_family = Some(FontFamilyName(font_family.into()));
     });
 }
 
@@ -135,8 +147,9 @@ fn write_font_ligatures(enabled: bool, cx: &mut App) {
     let fs = <dyn Fs>::global(cx);
     let bit = if enabled { 1 } else { 0 };
 
-    update_settings_file::<ThemeSettings>(fs, cx, move |theme_settings, _| {
-        let mut features = theme_settings
+    update_settings_file(fs, cx, move |settings, _| {
+        let mut features = settings
+            .theme
             .buffer_font_features
             .as_mut()
             .map(|features| features.tag_value_list().to_vec())
@@ -148,13 +161,13 @@ fn write_font_ligatures(enabled: bool, cx: &mut App) {
             features.push(("calt".into(), bit));
         }
 
-        theme_settings.buffer_font_features = Some(FontFeatures(Arc::new(features)));
+        settings.theme.buffer_font_features = Some(FontFeatures(Arc::new(features)));
     });
 }
 
 fn read_format_on_save(cx: &App) -> bool {
     match AllLanguageSettings::get_global(cx).defaults.format_on_save {
-        FormatOnSave::On | FormatOnSave::List(_) => true,
+        FormatOnSave::On => true,
         FormatOnSave::Off => false,
     }
 }
@@ -162,8 +175,8 @@ fn read_format_on_save(cx: &App) -> bool {
 fn write_format_on_save(format_on_save: bool, cx: &mut App) {
     let fs = <dyn Fs>::global(cx);
 
-    update_settings_file::<AllLanguageSettings>(fs, cx, move |language_settings, _| {
-        language_settings.defaults.format_on_save = Some(match format_on_save {
+    update_settings_file(fs, cx, move |settings, _| {
+        settings.project.all_languages.defaults.format_on_save = Some(match format_on_save {
             true => FormatOnSave::On,
             false => FormatOnSave::Off,
         });
@@ -197,7 +210,7 @@ fn render_setting_import_button(
                                     .color(Color::Muted)
                                     .size(IconSize::XSmall),
                             )
-                            .child(Label::new(label)),
+                            .child(Label::new(label.clone())),
                     )
                     .when(imported, |this| {
                         this.child(
@@ -212,7 +225,10 @@ fn render_setting_import_button(
                         )
                     }),
             )
-            .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
+            .on_click(move |_, window, cx| {
+                telemetry::event!("Welcome Import Settings", import_source = label,);
+                window.dispatch_action(action.boxed_clone(), cx);
+            }),
     )
 }
 
@@ -293,7 +309,7 @@ fn render_font_customization_section(
                         .child(
                             PopoverMenu::new("ui-font-picker")
                                 .menu({
-                                    let ui_font_picker = ui_font_picker.clone();
+                                    let ui_font_picker = ui_font_picker;
                                     move |_window, _cx| Some(ui_font_picker.clone())
                                 })
                                 .trigger(
@@ -325,23 +341,14 @@ fn render_font_customization_section(
                                 })
                                 .with_handle(ui_font_handle),
                         )
-                        .child(
-                            NumericStepper::new(
-                                "ui-font-size",
-                                ui_font_size.to_string(),
-                                move |_, _, cx| {
-                                    write_ui_font_size(ui_font_size - px(1.), cx);
-                                },
-                                move |_, _, cx| {
-                                    write_ui_font_size(ui_font_size + px(1.), cx);
-                                },
-                            )
-                            .style(ui::NumericStepperStyle::Outlined)
-                            .tab_index({
-                                *tab_index += 2;
-                                *tab_index - 2
-                            }),
-                        ),
+                        .child(font_picker_stepper(
+                            "ui-font-size",
+                            &ui_font_size,
+                            tab_index,
+                            write_ui_font_size,
+                            window,
+                            cx,
+                        )),
                 ),
         )
         .child(
@@ -357,7 +364,7 @@ fn render_font_customization_section(
                         .child(
                             PopoverMenu::new("buffer-font-picker")
                                 .menu({
-                                    let buffer_font_picker = buffer_font_picker.clone();
+                                    let buffer_font_picker = buffer_font_picker;
                                     move |_window, _cx| Some(buffer_font_picker.clone())
                                 })
                                 .trigger(
@@ -389,25 +396,59 @@ fn render_font_customization_section(
                                 })
                                 .with_handle(buffer_font_handle),
                         )
-                        .child(
-                            NumericStepper::new(
-                                "buffer-font-size",
-                                buffer_font_size.to_string(),
-                                move |_, _, cx| {
-                                    write_buffer_font_size(buffer_font_size - px(1.), cx);
-                                },
-                                move |_, _, cx| {
-                                    write_buffer_font_size(buffer_font_size + px(1.), cx);
-                                },
-                            )
-                            .style(ui::NumericStepperStyle::Outlined)
-                            .tab_index({
-                                *tab_index += 2;
-                                *tab_index - 2
-                            }),
-                        ),
+                        .child(font_picker_stepper(
+                            "buffer-font-size",
+                            &buffer_font_size,
+                            tab_index,
+                            write_buffer_font_size,
+                            window,
+                            cx,
+                        )),
                 ),
         )
+}
+
+fn font_picker_stepper(
+    id: &'static str,
+    font_size: &Pixels,
+    tab_index: &mut isize,
+    write_font_size: fn(Pixels, &mut App),
+    window: &mut Window,
+    cx: &mut App,
+) -> NumericStepper<u32> {
+    window.with_id(id, |window| {
+        let optimistic_font_size: gpui::Entity<Option<u32>> = window.use_state(cx, |_, _| None);
+        optimistic_font_size.update(cx, |optimistic_font_size, _| {
+            if let Some(optimistic_font_size_val) = optimistic_font_size {
+                if *optimistic_font_size_val == u32::from(font_size) {
+                    *optimistic_font_size = None;
+                }
+            }
+        });
+
+        let stepper_font_size = optimistic_font_size
+            .read(cx)
+            .unwrap_or_else(|| font_size.into());
+
+        NumericStepper::new(
+            SharedString::new(format!("{}-stepper", id)),
+            stepper_font_size,
+            window,
+            cx,
+        )
+        .on_change(move |new_value, _, cx| {
+            optimistic_font_size.write(cx, Some(*new_value));
+            write_font_size(Pixels::from(*new_value), cx);
+        })
+        .format(|value| format!("{value}px"))
+        .style(ui_input::NumericStepperStyle::Outlined)
+        .tab_index({
+            *tab_index += 2;
+            *tab_index - 2
+        })
+        .min(6)
+        .max(32)
+    })
 }
 
 type FontPicker = Picker<FontPickerDelegate>;
@@ -428,28 +469,28 @@ impl FontPickerDelegate {
     ) -> Self {
         let font_family_cache = FontFamilyCache::global(cx);
 
-        let fonts: Vec<SharedString> = font_family_cache
-            .list_font_families(cx)
-            .into_iter()
-            .collect();
-
+        let fonts = font_family_cache
+            .try_list_font_families()
+            .unwrap_or_else(|| vec![current_font.clone()]);
         let selected_index = fonts
             .iter()
             .position(|font| *font == current_font)
             .unwrap_or(0);
 
+        let filtered_fonts = fonts
+            .iter()
+            .enumerate()
+            .map(|(index, font)| StringMatch {
+                candidate_id: index,
+                string: font.to_string(),
+                positions: Vec::new(),
+                score: 0.0,
+            })
+            .collect();
+
         Self {
-            fonts: fonts.clone(),
-            filtered_fonts: fonts
-                .iter()
-                .enumerate()
-                .map(|(index, font)| StringMatch {
-                    candidate_id: index,
-                    string: font.to_string(),
-                    positions: Vec::new(),
-                    score: 0.0,
-                })
-                .collect(),
+            fonts,
+            filtered_fonts,
             selected_index,
             current_font,
             on_font_changed: Arc::new(on_font_changed),
@@ -573,7 +614,7 @@ fn font_picker(
 ) -> FontPicker {
     let delegate = FontPickerDelegate::new(current_font, on_font_changed, cx);
 
-    Picker::list(delegate, window, cx)
+    Picker::uniform_list(delegate, window, cx)
         .show_scrollbar(true)
         .width(rems_from_px(210.))
         .max_height(Some(rems(20.).into()))
@@ -584,8 +625,8 @@ fn render_popular_settings_section(
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
-    const LIGATURE_TOOLTIP: &'static str =
-        "Font ligatures combine two characters into one. For example, turning =/= into ≠.";
+    const LIGATURE_TOOLTIP: &str =
+        "Font ligatures combine two characters into one. For example, turning != into ≠.";
 
     v_flex()
         .pt_6()
@@ -605,7 +646,13 @@ fn render_popular_settings_section(
                     ui::ToggleState::Unselected
                 },
                 |toggle_state, _, cx| {
-                    write_font_ligatures(toggle_state == &ToggleState::Selected, cx);
+                    let enabled = toggle_state == &ToggleState::Selected;
+                    telemetry::event!(
+                        "Welcome Font Ligature",
+                        options = if enabled { "on" } else { "off" },
+                    );
+
+                    write_font_ligatures(enabled, cx);
                 },
             )
             .tab_index({
@@ -625,7 +672,13 @@ fn render_popular_settings_section(
                     ui::ToggleState::Unselected
                 },
                 |toggle_state, _, cx| {
-                    write_format_on_save(toggle_state == &ToggleState::Selected, cx);
+                    let enabled = toggle_state == &ToggleState::Selected;
+                    telemetry::event!(
+                        "Welcome Format On Save Changed",
+                        options = if enabled { "on" } else { "off" },
+                    );
+
+                    write_format_on_save(enabled, cx);
                 },
             )
             .tab_index({
@@ -644,7 +697,13 @@ fn render_popular_settings_section(
                     ui::ToggleState::Unselected
                 },
                 |toggle_state, _, cx| {
-                    write_inlay_hints(toggle_state == &ToggleState::Selected, cx);
+                    let enabled = toggle_state == &ToggleState::Selected;
+                    telemetry::event!(
+                        "Welcome Inlay Hints Changed",
+                        options = if enabled { "on" } else { "off" },
+                    );
+
+                    write_inlay_hints(enabled, cx);
                 },
             )
             .tab_index({
@@ -663,7 +722,13 @@ fn render_popular_settings_section(
                     ui::ToggleState::Unselected
                 },
                 |toggle_state, _, cx| {
-                    set_git_blame(toggle_state == &ToggleState::Selected, cx);
+                    let enabled = toggle_state == &ToggleState::Selected;
+                    telemetry::event!(
+                        "Welcome Git Blame Changed",
+                        options = if enabled { "on" } else { "off" },
+                    );
+
+                    write_git_blame(enabled, cx);
                 },
             )
             .tab_index({
@@ -676,7 +741,7 @@ fn render_popular_settings_section(
                 .items_start()
                 .justify_between()
                 .child(
-                    v_flex().child(Label::new("Mini Map")).child(
+                    v_flex().child(Label::new("Minimap")).child(
                         Label::new("See a high-level overview of your source code.")
                             .color(Color::Muted),
                     ),
@@ -706,7 +771,7 @@ fn render_popular_settings_section(
                     })
                     .tab_index(tab_index)
                     .style(ToggleButtonGroupStyle::Outlined)
-                    .button_width(ui::rems_from_px(64.)),
+                    .width(ui::rems_from_px(3. * 64.)),
                 ),
         )
 }
