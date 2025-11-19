@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use collections::{HashMap, HashSet};
 use gpui::{Modifiers, SharedString};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 use serde_with::skip_serializing_none;
 use settings_macros::MergeFrom;
 use std::sync::Arc;
@@ -68,9 +68,7 @@ pub struct FeaturesContent {
 }
 
 /// The provider that supplies edit predictions.
-#[derive(
-    Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom,
-)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionProvider {
     None,
@@ -79,6 +77,47 @@ pub enum EditPredictionProvider {
     Supermaven,
     Zed,
     Codestral,
+    Experimental(&'static str),
+}
+
+pub const EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME: &str = "sweep";
+
+impl<'de> Deserialize<'de> for EditPredictionProvider {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum Content {
+            None,
+            Copilot,
+            Supermaven,
+            Zed,
+            Codestral,
+            Experimental(String),
+        }
+
+        Ok(match Content::deserialize(deserializer)? {
+            Content::None => EditPredictionProvider::None,
+            Content::Copilot => EditPredictionProvider::Copilot,
+            Content::Supermaven => EditPredictionProvider::Supermaven,
+            Content::Zed => EditPredictionProvider::Zed,
+            Content::Codestral => EditPredictionProvider::Codestral,
+            Content::Experimental(name) => {
+                if name == EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME {
+                    EditPredictionProvider::Experimental(
+                        EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
+                    )
+                } else {
+                    return Err(D::Error::custom(format!(
+                        "Unknown experimental edit prediction provider: {}",
+                        name
+                    )));
+                }
+            }
+        })
+    }
 }
 
 impl EditPredictionProvider {
@@ -88,7 +127,8 @@ impl EditPredictionProvider {
             EditPredictionProvider::None
             | EditPredictionProvider::Copilot
             | EditPredictionProvider::Supermaven
-            | EditPredictionProvider::Codestral => false,
+            | EditPredictionProvider::Codestral
+            | EditPredictionProvider::Experimental(_) => false,
         }
     }
 }
@@ -142,11 +182,27 @@ pub struct CodestralSettingsContent {
     /// Default: 150
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Api URL to use for completions.
+    ///
+    /// Default: "https://codestral.mistral.ai"
+    #[serde(default)]
+    pub api_url: Option<String>,
 }
 
 /// The mode in which edit predictions should be displayed.
 #[derive(
-    Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionsMode {
@@ -296,12 +352,12 @@ pub struct LanguageSettingsContent {
     /// Inlay hint related settings.
     pub inlay_hints: Option<InlayHintSettingsContent>,
     /// Whether to automatically type closing characters for you. For example,
-    /// when you type (, Zed will automatically add a closing ) at the correct position.
+    /// when you type '(', Zed will automatically add a closing ')' at the correct position.
     ///
     /// Default: true
     pub use_autoclose: Option<bool>,
     /// Whether to automatically surround text with characters for you. For example,
-    /// when you select text and type (, Zed will automatically surround text with ().
+    /// when you select text and type '(', Zed will automatically surround text with ().
     ///
     /// Default: true
     pub use_auto_surround: Option<bool>,
@@ -318,7 +374,7 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: true
     pub use_on_type_format: Option<bool>,
-    /// Which code actions to run on save after the formatter.
+    /// Which code actions to run on save before the formatter.
     /// These are not run if formatting is off.
     ///
     /// Default: {} (or {"source.organizeImports": true} for Go).

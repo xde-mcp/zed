@@ -23,6 +23,7 @@ use collections::HashMap;
 use editor::{
     Anchor, Bias, Editor, EditorEvent, EditorSettings, HideMouseCursorOrigin, SelectionEffects,
     ToPoint,
+    actions::Paste,
     movement::{self, FindRange},
 };
 use gpui::{
@@ -39,6 +40,7 @@ use normal::search::SearchSubmit;
 use object::Object;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use settings::RegisterSetting;
 pub use settings::{
     ModeContent, Settings, SettingsStore, UseSystemClipboard, update_settings_file,
 };
@@ -181,8 +183,6 @@ actions!(
         InnerObject,
         /// Maximizes the current pane.
         MaximizePane,
-        /// Opens the default keymap file.
-        OpenDefaultKeymap,
         /// Resets all pane sizes to default.
         ResetPaneSizes,
         /// Resizes the pane to the right.
@@ -260,13 +260,13 @@ actions!(
     [
         /// Toggles Vim mode on or off.
         ToggleVimMode,
+        /// Toggles Helix mode on or off.
+        ToggleHelixMode,
     ]
 );
 
 /// Initializes the `vim` crate.
 pub fn init(cx: &mut App) {
-    vim_mode_setting::init(cx);
-    VimSettings::register(cx);
     VimGlobals::register(cx);
 
     cx.observe_new(Vim::register).detach();
@@ -274,9 +274,23 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleVimMode, _, cx| {
             let fs = workspace.app_state().fs.clone();
-            let currently_enabled = Vim::enabled(cx);
+            let currently_enabled = VimModeSetting::get_global(cx).0;
             update_settings_file(fs, cx, move |setting, _| {
-                setting.vim_mode = Some(!currently_enabled)
+                setting.vim_mode = Some(!currently_enabled);
+                if let Some(helix_mode) = &mut setting.helix_mode {
+                    *helix_mode = false;
+                }
+            })
+        });
+
+        workspace.register_action(|workspace, _: &ToggleHelixMode, _, cx| {
+            let fs = workspace.app_state().fs.clone();
+            let currently_enabled = HelixModeSetting::get_global(cx).0;
+            update_settings_file(fs, cx, move |setting, _| {
+                setting.helix_mode = Some(!currently_enabled);
+                if let Some(vim_mode) = &mut setting.vim_mode {
+                    *vim_mode = false;
+                }
             })
         });
 
@@ -298,7 +312,7 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|_, _: &ToggleProjectPanelFocus, window, cx| {
             if Vim::take_count(cx).is_none() {
-                window.dispatch_action(project_panel::ToggleFocus.boxed_clone(), cx);
+                window.dispatch_action(zed_actions::project_panel::ToggleFocus.boxed_clone(), cx);
             }
         });
 
@@ -327,7 +341,7 @@ pub fn init(cx: &mut App) {
             };
         });
 
-        workspace.register_action(|_, _: &OpenDefaultKeymap, _, cx| {
+        workspace.register_action(|_, _: &zed_actions::vim::OpenDefaultKeymap, _, cx| {
             cx.emit(workspace::Event::OpenBundledFile {
                 text: settings::vim_keymap(),
                 title: "Default Vim Bindings",
@@ -903,6 +917,17 @@ impl Vim {
                 );
             });
 
+            Vim::action(
+                editor,
+                cx,
+                |vim, _: &editor::actions::Paste, window, cx| match vim.mode {
+                    Mode::Replace => vim.paste_replace(window, cx),
+                    _ => {
+                        vim.update_editor(cx, |_, editor, cx| editor.paste(&Paste, window, cx));
+                    }
+                },
+            );
+
             normal::register(editor, cx);
             insert::register(editor, cx);
             helix::register(editor, cx);
@@ -916,9 +941,11 @@ impl Vim {
             change_list::register(editor, cx);
             digraph::register(editor, cx);
 
-            cx.defer_in(window, |vim, window, cx| {
-                vim.focused(false, window, cx);
-            })
+            if editor.is_focused(window) {
+                cx.defer_in(window, |vim, window, cx| {
+                    vim.focused(false, window, cx);
+                })
+            }
         })
     }
 
@@ -1181,7 +1208,7 @@ impl Vim {
                     s.select_anchor_ranges(vec![pos..pos])
                 }
 
-                let snapshot = s.display_map();
+                let snapshot = s.display_snapshot();
                 if let Some(pending) = s.pending_anchor_mut()
                     && pending.reversed
                     && mode.is_visual()
@@ -1359,7 +1386,10 @@ impl Vim {
             return;
         };
         let newest_selection_empty = editor.update(cx, |editor, cx| {
-            editor.selections.newest::<usize>(cx).is_empty()
+            editor
+                .selections
+                .newest::<usize>(&editor.display_snapshot(cx))
+                .is_empty()
         });
         let editor = editor.read(cx);
         let editor_mode = editor.mode();
@@ -1455,9 +1485,11 @@ impl Vim {
         cx: &mut Context<Self>,
     ) -> Option<String> {
         self.update_editor(cx, |_, editor, cx| {
-            let selection = editor.selections.newest::<usize>(cx);
+            let snapshot = &editor.snapshot(window, cx);
+            let selection = editor
+                .selections
+                .newest::<usize>(&snapshot.display_snapshot);
 
-            let snapshot = editor.snapshot(window, cx);
             let snapshot = snapshot.buffer_snapshot();
             let (range, kind) =
                 snapshot.surrounding_word(selection.start, Some(CharScopeContext::Completion));
@@ -1484,9 +1516,11 @@ impl Vim {
 
                 let selections = self.editor().map(|editor| {
                     editor.update(cx, |editor, cx| {
+                        let snapshot = editor.display_snapshot(cx);
+
                         (
-                            editor.selections.oldest::<Point>(cx),
-                            editor.selections.newest::<Point>(cx),
+                            editor.selections.oldest::<Point>(&snapshot),
+                            editor.selections.newest::<Point>(&snapshot),
                         )
                     })
                 });
@@ -1908,6 +1942,7 @@ impl Vim {
     }
 }
 
+#[derive(RegisterSetting)]
 struct VimSettings {
     pub default_mode: Mode,
     pub toggle_relative_line_numbers: bool,

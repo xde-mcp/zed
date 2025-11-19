@@ -8,7 +8,8 @@ use settings_macros::MergeFrom;
 use util::serde::default_true;
 
 use crate::{
-    AllLanguageSettingsContent, ExtendingVec, ProjectTerminalSettingsContent, SlashCommandSettings,
+    AllLanguageSettingsContent, DelayMs, ExtendingVec, ProjectTerminalSettingsContent,
+    SlashCommandSettings,
 };
 
 #[skip_serializing_none]
@@ -55,11 +56,19 @@ pub struct ProjectSettingsContent {
 #[skip_serializing_none]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct WorktreeSettingsContent {
-    /// The displayed name of this project. If not set or empty, the root directory name
+    /// The displayed name of this project. If not set or null, the root directory name
     /// will be displayed.
     ///
-    /// Default: ""
+    /// Default: null
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+
+    /// Whether to prevent this project from being shared in public channels.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub prevent_sharing_in_public_channels: bool,
 
     /// Completely ignore files matching globs from `file_scan_exclusions`. Overrides
     /// `file_scan_inclusions`.
@@ -88,6 +97,10 @@ pub struct WorktreeSettingsContent {
     /// Treat the files matching these globs as `.env` files.
     /// Default: ["**/.env*", "**/*.pem", "**/*.key", "**/*.cert", "**/*.crt", "**/secrets.yml"]
     pub private_files: Option<ExtendingVec<String>>,
+
+    /// Treat the files matching these globs as hidden files. You can hide hidden files in the project panel.
+    /// Default: ["**/.*"]
+    pub hidden_files: Option<Vec<String>>,
 }
 
 #[skip_serializing_none]
@@ -95,7 +108,17 @@ pub struct WorktreeSettingsContent {
 #[serde(rename_all = "snake_case")]
 pub struct LspSettings {
     pub binary: Option<BinarySettings>,
+    /// Options passed to the language server at startup.
+    ///
+    /// Ref: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialize
+    ///
+    /// Consult the documentation for the specific language server to see which settings are supported.
     pub initialization_options: Option<serde_json::Value>,
+    /// Language server settings.
+    ///
+    /// Ref: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_configuration
+    ///
+    /// Consult the documentation for the specific language server to see which settings are supported.
     pub settings: Option<serde_json::Value>,
     /// If the server supports sending tasks over LSP extensions,
     /// this setting can be used to enable or disable them in Zed.
@@ -154,6 +177,8 @@ pub struct DapSettingsContent {
     pub binary: Option<String>,
     #[serde(default)]
     pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
 }
 
 #[skip_serializing_none]
@@ -171,7 +196,7 @@ pub struct SessionSettingsContent {
 }
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema, MergeFrom, Debug)]
-#[serde(tag = "source", rename_all = "snake_case")]
+#[serde(untagged, rename_all = "snake_case")]
 pub enum ContextServerSettingsContent {
     Custom {
         /// Whether the context server is enabled.
@@ -180,6 +205,16 @@ pub enum ContextServerSettingsContent {
 
         #[serde(flatten)]
         command: ContextServerCommand,
+    },
+    Http {
+        /// Whether the context server is enabled.
+        #[serde(default = "default_true")]
+        enabled: bool,
+        /// The URL of the remote context server.
+        url: String,
+        /// Optional headers to send.
+        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+        headers: HashMap<String, String>,
     },
     Extension {
         /// Whether the context server is enabled.
@@ -192,19 +227,24 @@ pub enum ContextServerSettingsContent {
         settings: serde_json::Value,
     },
 }
+
 impl ContextServerSettingsContent {
     pub fn set_enabled(&mut self, enabled: bool) {
         match self {
             ContextServerSettingsContent::Custom {
                 enabled: custom_enabled,
-                command: _,
+                ..
             } => {
                 *custom_enabled = enabled;
             }
             ContextServerSettingsContent::Extension {
                 enabled: ext_enabled,
-                settings: _,
+                ..
             } => *ext_enabled = enabled,
+            ContextServerSettingsContent::Http {
+                enabled: remote_enabled,
+                ..
+            } => *remote_enabled = enabled,
         }
     }
 }
@@ -308,7 +348,7 @@ pub struct InlineBlameSettings {
     /// after a delay once the cursor stops moving.
     ///
     /// Default: 0
-    pub delay_ms: Option<u64>,
+    pub delay_ms: Option<DelayMs>,
     /// The amount of padding between the end of the source line and the start
     /// of the inline blame in units of columns.
     ///
@@ -395,7 +435,7 @@ pub struct LspPullDiagnosticsSettingsContent {
     /// 0 turns the debounce off.
     ///
     /// Default: 50
-    pub debounce_ms: Option<u64>,
+    pub debounce_ms: Option<DelayMs>,
 }
 
 #[skip_serializing_none]
@@ -411,7 +451,7 @@ pub struct InlineDiagnosticsSettingsContent {
     /// last editor event.
     ///
     /// Default: 150
-    pub update_debounce_ms: Option<u64>,
+    pub update_debounce_ms: Option<DelayMs>,
     /// The amount of padding between the end of the source line and the start
     /// of the inline diagnostic in units of columns.
     ///

@@ -485,6 +485,7 @@ pub struct GitPanelSettingsContent {
     /// Default width of the panel in pixels.
     ///
     /// Default: 360
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub default_width: Option<f32>,
     /// How entry statuses are displayed.
     ///
@@ -556,6 +557,7 @@ pub struct NotificationPanelSettingsContent {
     /// Default width of the panel in pixels.
     ///
     /// Default: 300
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub default_width: Option<f32>,
 }
 
@@ -573,6 +575,7 @@ pub struct PanelSettingsContent {
     /// Default width of the panel in pixels.
     ///
     /// Default: 240
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub default_width: Option<f32>,
 }
 
@@ -608,14 +611,33 @@ pub struct FileFinderSettingsContent {
     /// Whether to use gitignored files when searching.
     /// Only the file Zed had indexed will be used, not necessary all the gitignored files.
     ///
-    /// Can accept 3 values:
-    /// * `Some(true)`: Use all gitignored files
-    /// * `Some(false)`: Use only the files Zed had indexed
-    /// * `None`: Be smart and search for ignored when called from a gitignored worktree
-    ///
-    /// Default: None
-    /// todo() -> Change this type to an enum
-    pub include_ignored: Option<bool>,
+    /// Default: Smart
+    pub include_ignored: Option<IncludeIgnoredContent>,
+}
+
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Clone,
+    Copy,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IncludeIgnoredContent {
+    /// Use all gitignored files
+    All,
+    /// Use only the files Zed had indexed
+    Indexed,
+    /// Be smart and search for ignored when called from a gitignored worktree
+    #[default]
+    Smart,
 }
 
 #[derive(
@@ -728,6 +750,7 @@ pub struct OutlinePanelSettingsContent {
     /// Customize default width (in pixels) taken by outline panel
     ///
     /// Default: 240
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub default_width: Option<f32>,
     /// The position of outline panel
     ///
@@ -748,6 +771,7 @@ pub struct OutlinePanelSettingsContent {
     /// Amount of indentation (in pixels) for nested items.
     ///
     /// Default: 20
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub indent_size: Option<f32>,
     /// Whether to reveal it in the outline panel automatically,
     /// when a corresponding project entry becomes active.
@@ -983,5 +1007,35 @@ impl From<SaturatingBool> for bool {
 impl merge_from::MergeFrom for SaturatingBool {
     fn merge_from(&mut self, other: &Self) {
         self.0 |= other.0
+    }
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    MergeFrom,
+    JsonSchema,
+    derive_more::FromStr,
+)]
+#[serde(transparent)]
+pub struct DelayMs(pub u64);
+
+impl From<u64> for DelayMs {
+    fn from(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+impl std::fmt::Display for DelayMs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}ms", self.0)
     }
 }
