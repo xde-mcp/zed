@@ -1,13 +1,12 @@
-use crate::{
-    rpc::RECONNECT_TIMEOUT,
-    tests::{TestServer, rust_lang},
-};
+use crate::{rpc::RECONNECT_TIMEOUT, tests::TestServer};
 use call::ActiveCall;
 use editor::{
-    DocumentColorsRenderMode, Editor, FETCH_COLORS_DEBOUNCE_TIMEOUT, RowInfo, SelectionEffects,
+    DocumentColorsRenderMode, Editor, FETCH_COLORS_DEBOUNCE_TIMEOUT, MultiBufferOffset, RowInfo,
+    SelectionEffects,
     actions::{
-        ConfirmCodeAction, ConfirmCompletion, ConfirmRename, ContextMenuFirst,
-        ExpandMacroRecursively, MoveToEnd, Redo, Rename, SelectAll, ToggleCodeActions, Undo,
+        ConfirmCodeAction, ConfirmCompletion, ConfirmRename, ContextMenuFirst, CopyFileLocation,
+        CopyFileName, CopyFileNameWithoutExtension, ExpandMacroRecursively, MoveToEnd, Redo,
+        Rename, SelectAll, ToggleCodeActions, Undo,
     },
     test::{
         editor_test_context::{AssertionContextManager, EditorTestContext},
@@ -21,8 +20,9 @@ use gpui::{
     App, Rgba, SharedString, TestAppContext, UpdateGlobal, VisualContext, VisualTestContext,
 };
 use indoc::indoc;
-use language::FakeLspAdapter;
+use language::{FakeLspAdapter, rust_lang};
 use lsp::LSP_REQUEST_TIMEOUT;
+use pretty_assertions::assert_eq;
 use project::{
     ProgressToken, ProjectPath, SERVER_PROGRESS_THROTTLE_TIMEOUT,
     lsp_store::lsp_ext_command::{ExpandedMacro, LspExtExpandMacro},
@@ -312,6 +312,49 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
             "Rust",
             FakeLspAdapter {
                 capabilities: capabilities.clone(),
+                initializer: Some(Box::new(|fake_server| {
+                    fake_server.set_request_handler::<lsp::request::Completion, _, _>(
+                        |params, _| async move {
+                            assert_eq!(
+                                params.text_document_position.text_document.uri,
+                                lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
+                            );
+                            assert_eq!(
+                                params.text_document_position.position,
+                                lsp::Position::new(0, 14),
+                            );
+
+                            Ok(Some(lsp::CompletionResponse::Array(vec![
+                                lsp::CompletionItem {
+                                    label: "first_method(…)".into(),
+                                    detail: Some("fn(&mut self, B) -> C".into()),
+                                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                                        new_text: "first_method($1)".to_string(),
+                                        range: lsp::Range::new(
+                                            lsp::Position::new(0, 14),
+                                            lsp::Position::new(0, 14),
+                                        ),
+                                    })),
+                                    insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
+                                    ..Default::default()
+                                },
+                                lsp::CompletionItem {
+                                    label: "second_method(…)".into(),
+                                    detail: Some("fn(&mut self, C) -> D<E>".into()),
+                                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                                        new_text: "second_method()".to_string(),
+                                        range: lsp::Range::new(
+                                            lsp::Position::new(0, 14),
+                                            lsp::Position::new(0, 14),
+                                        ),
+                                    })),
+                                    insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
+                                    ..Default::default()
+                                },
+                            ])))
+                        },
+                    );
+                })),
                 ..FakeLspAdapter::default()
             },
         ),
@@ -320,6 +363,11 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
             FakeLspAdapter {
                 name: "fake-analyzer",
                 capabilities: capabilities.clone(),
+                initializer: Some(Box::new(|fake_server| {
+                    fake_server.set_request_handler::<lsp::request::Completion, _, _>(
+                        |_, _| async move { Ok(None) },
+                    );
+                })),
                 ..FakeLspAdapter::default()
             },
         ),
@@ -373,6 +421,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     let fake_language_server = fake_language_servers[0].next().await.unwrap();
     let second_fake_language_server = fake_language_servers[1].next().await.unwrap();
     cx_a.background_executor.run_until_parked();
+    cx_b.background_executor.run_until_parked();
 
     buffer_b.read_with(cx_b, |buffer, _| {
         assert!(!buffer.completion_triggers().is_empty())
@@ -381,64 +430,15 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     // Type a completion trigger character as the guest.
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input(".", window, cx);
     });
     cx_b.focus(&editor_b);
 
-    // Receive a completion request as the host's language server.
-    // Return some completions from the host's language server.
-    cx_a.executor().start_waiting();
-    fake_language_server
-        .set_request_handler::<lsp::request::Completion, _, _>(|params, _| async move {
-            assert_eq!(
-                params.text_document_position.text_document.uri,
-                lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
-            );
-            assert_eq!(
-                params.text_document_position.position,
-                lsp::Position::new(0, 14),
-            );
-
-            Ok(Some(lsp::CompletionResponse::Array(vec![
-                lsp::CompletionItem {
-                    label: "first_method(…)".into(),
-                    detail: Some("fn(&mut self, B) -> C".into()),
-                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                        new_text: "first_method($1)".to_string(),
-                        range: lsp::Range::new(
-                            lsp::Position::new(0, 14),
-                            lsp::Position::new(0, 14),
-                        ),
-                    })),
-                    insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                    ..Default::default()
-                },
-                lsp::CompletionItem {
-                    label: "second_method(…)".into(),
-                    detail: Some("fn(&mut self, C) -> D<E>".into()),
-                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                        new_text: "second_method()".to_string(),
-                        range: lsp::Range::new(
-                            lsp::Position::new(0, 14),
-                            lsp::Position::new(0, 14),
-                        ),
-                    })),
-                    insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                    ..Default::default()
-                },
-            ])))
-        })
-        .next()
-        .await
-        .unwrap();
-    second_fake_language_server
-        .set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move { Ok(None) })
-        .next()
-        .await
-        .unwrap();
-    cx_a.executor().finish_waiting();
+    // Allow the completion request to propagate from guest to host to LSP.
+    cx_b.background_executor.run_until_parked();
+    cx_a.background_executor.run_until_parked();
 
     // Open the buffer on the host.
     let buffer_a = project_a
@@ -484,6 +484,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
 
     // The additional edit is applied.
     cx_a.executor().run_until_parked();
+    cx_b.executor().run_until_parked();
 
     buffer_a.read_with(cx_a, |buffer, _| {
         assert_eq!(
@@ -503,7 +504,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     // resolved
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([46..46])
+            s.select_ranges([MultiBufferOffset(46)..MultiBufferOffset(46)])
         });
         editor.handle_input("; a", window, cx);
         editor.handle_input(".", window, cx);
@@ -601,7 +602,7 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
     // Add another completion trigger to test the second language server
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([68..68])
+            s.select_ranges([MultiBufferOffset(68)..MultiBufferOffset(68)])
         });
         editor.handle_input("; b", window, cx);
         editor.handle_input(".", window, cx);
@@ -641,12 +642,10 @@ async fn test_collaborating_with_completion(cx_a: &mut TestAppContext, cx_b: &mu
                         ),
                     })),
                     insert_text_format: Some(lsp::InsertTextFormat::SNIPPET),
-                    ..Default::default()
+                    ..lsp::CompletionItem::default()
                 },
             ])))
         });
-
-    cx_b.executor().run_until_parked();
 
     // Await both language server responses
     first_lsp_completion.next().await.unwrap();
@@ -950,7 +949,7 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
     // Move cursor to a location that can be renamed.
     let prepare_rename = editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([7..7])
+            s.select_ranges([MultiBufferOffset(7)..MultiBufferOffset(7)])
         });
         editor.rename(&Rename, window, cx).unwrap()
     });
@@ -977,17 +976,17 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
         let buffer = editor.buffer().read(cx).snapshot(cx);
         assert_eq!(
             rename.range.start.to_offset(&buffer)..rename.range.end.to_offset(&buffer),
-            6..9
+            MultiBufferOffset(6)..MultiBufferOffset(9)
         );
         rename.editor.update(cx, |rename_editor, cx| {
-            let rename_selection = rename_editor.selections.newest::<usize>(&rename_editor.display_snapshot(cx));
+            let rename_selection = rename_editor.selections.newest::<MultiBufferOffset>(&rename_editor.display_snapshot(cx));
             assert_eq!(
                 rename_selection.range(),
-                0..3,
+                MultiBufferOffset(0)..MultiBufferOffset(3),
                 "Rename that was triggered from zero selection caret, should propose the whole word."
             );
             rename_editor.buffer().update(cx, |rename_buffer, cx| {
-                rename_buffer.edit([(0..3, "THREE")], None, cx);
+                rename_buffer.edit([(MultiBufferOffset(0)..MultiBufferOffset(3), "THREE")], None, cx);
             });
         });
     });
@@ -998,7 +997,7 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
     });
     let prepare_rename = editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([7..8])
+            s.select_ranges([MultiBufferOffset(7)..MultiBufferOffset(8)])
         });
         editor.rename(&Rename, window, cx).unwrap()
     });
@@ -1025,16 +1024,16 @@ async fn test_collaborating_with_renames(cx_a: &mut TestAppContext, cx_b: &mut T
         let buffer = editor.buffer().read(cx).snapshot(cx);
         let lsp_rename_start = rename.range.start.to_offset(&buffer);
         let lsp_rename_end = rename.range.end.to_offset(&buffer);
-        assert_eq!(lsp_rename_start..lsp_rename_end, 6..9);
+        assert_eq!(lsp_rename_start..lsp_rename_end, MultiBufferOffset(6)..MultiBufferOffset(9));
         rename.editor.update(cx, |rename_editor, cx| {
-            let rename_selection = rename_editor.selections.newest::<usize>(&rename_editor.display_snapshot(cx));
+            let rename_selection = rename_editor.selections.newest::<MultiBufferOffset>(&rename_editor.display_snapshot(cx));
             assert_eq!(
                 rename_selection.range(),
-                1..2,
+                MultiBufferOffset(1)..MultiBufferOffset(2),
                 "Rename that was triggered from a selection, should have the same selection range in the rename proposal"
             );
             rename_editor.buffer().update(cx, |rename_buffer, cx| {
-                rename_buffer.edit([(0..lsp_rename_end - lsp_rename_start, "THREE")], None, cx);
+                rename_buffer.edit([(MultiBufferOffset(0)..MultiBufferOffset(lsp_rename_end - lsp_rename_start), "THREE")], None, cx);
             });
         });
     });
@@ -1237,7 +1236,7 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
     // Move cursor to a location, this should trigger the code lens call.
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([7..7])
+            s.select_ranges([MultiBufferOffset(7)..MultiBufferOffset(7)])
         });
     });
     let () = request_started_rx.next().await.unwrap();
@@ -1259,7 +1258,7 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
 
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([1..1])
+            s.select_ranges([MultiBufferOffset(1)..MultiBufferOffset(1)])
         });
     });
     let () = request_started_rx.next().await.unwrap();
@@ -1281,7 +1280,7 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
 
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([2..2])
+            s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
         });
     });
     let () = request_started_rx.next().await.unwrap();
@@ -1579,7 +1578,10 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
+            .selections_in_range(
+                text::Anchor::min_max_range_for_buffer(buffer.remote_id()),
+                false,
+            )
             .count()
             == 1
     });
@@ -1620,7 +1622,10 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
+            .selections_in_range(
+                text::Anchor::min_max_range_for_buffer(buffer.remote_id()),
+                false,
+            )
             .count()
             == 0
     });
@@ -1719,7 +1724,7 @@ async fn test_on_input_format_from_host_to_guest(
     cx_a.focus(&editor_a);
     editor_a.update_in(cx_a, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input(">", window, cx);
     });
@@ -1828,7 +1833,7 @@ async fn test_on_input_format_from_guest_to_host(
     cx_b.focus(&editor_b);
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input(":", window, cx);
     });
@@ -2056,7 +2061,7 @@ async fn test_mutual_editor_inlay_hint_cache_update(
     let after_client_edit = edits_made.fetch_add(1, atomic::Ordering::Release) + 1;
     editor_b.update_in(cx_b, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13].clone())
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)].clone())
         });
         editor.handle_input(":", window, cx);
     });
@@ -2080,7 +2085,7 @@ async fn test_mutual_editor_inlay_hint_cache_update(
     let after_host_edit = edits_made.fetch_add(1, atomic::Ordering::Release) + 1;
     editor_a.update_in(cx_a, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13])
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)])
         });
         editor.handle_input("a change to increment both buffers' versions", window, cx);
     });
@@ -2520,7 +2525,7 @@ async fn test_lsp_document_color(cx_a: &mut TestAppContext, cx_b: &mut TestAppCo
 
     editor_a.update_in(cx_a, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([13..13].clone())
+            s.select_ranges([MultiBufferOffset(13)..MultiBufferOffset(13)].clone())
         });
         editor.handle_input(":", window, cx);
     });
@@ -2957,7 +2962,7 @@ async fn test_lsp_pull_diagnostics(
     editor_a_main.update(cx_a, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(
             all_diagnostics.len(),
@@ -3086,7 +3091,7 @@ async fn test_lsp_pull_diagnostics(
     editor_a_main.update(cx_a, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(
             all_diagnostics.len(),
@@ -3133,7 +3138,7 @@ async fn test_lsp_pull_diagnostics(
     editor_b_main.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(
             all_diagnostics.len(),
@@ -3180,17 +3185,16 @@ async fn test_lsp_pull_diagnostics(
     editor_b_lib.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         let expected_messages = [
             expected_pull_diagnostic_lib_message,
-            // TODO bug: the pushed diagnostics are not being sent to the client when they open the corresponding buffer.
-            // expected_push_diagnostic_lib_message,
+            expected_push_diagnostic_lib_message,
         ];
         assert_eq!(
             all_diagnostics.len(),
-            1,
-            "Expected pull diagnostics, but got: {all_diagnostics:?}"
+            2,
+            "Expected pull and push diagnostics, but got: {all_diagnostics:?}"
         );
         for diagnostic in all_diagnostics {
             assert!(
@@ -3247,17 +3251,18 @@ async fn test_lsp_pull_diagnostics(
         editor_b_lib.update(cx_b, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let all_diagnostics = snapshot
-                .diagnostics_in_range(0..snapshot.len())
+                .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
                 .collect::<Vec<_>>();
             let expected_messages = [
-                expected_workspace_pull_diagnostics_lib_message,
-                // TODO bug: the pushed diagnostics are not being sent to the client when they open the corresponding buffer.
-                // expected_push_diagnostic_lib_message,
+                // Despite workspace diagnostics provided,
+                // the currently open file's diagnostics should be preferred, as LSP suggests.
+                expected_pull_diagnostic_lib_message,
+                expected_push_diagnostic_lib_message,
             ];
             assert_eq!(
                 all_diagnostics.len(),
-                1,
-                "Expected pull diagnostics, but got: {all_diagnostics:?}"
+                2,
+                "Expected pull and push diagnostics, but got: {all_diagnostics:?}"
             );
             for diagnostic in all_diagnostics {
                 assert!(
@@ -3370,8 +3375,9 @@ async fn test_lsp_pull_diagnostics(
         "Another workspace diagnostics pull should happen after the diagnostics refresh server request"
     );
     {
-        assert!(
-            diagnostics_pulls_result_ids.lock().await.len() == diagnostic_pulls_result_ids,
+        assert_eq!(
+            diagnostics_pulls_result_ids.lock().await.len(),
+            diagnostic_pulls_result_ids,
             "Pulls should not happen hence no extra ids should appear"
         );
         assert!(
@@ -3382,14 +3388,14 @@ async fn test_lsp_pull_diagnostics(
     editor_b_lib.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         let expected_messages = [
             expected_workspace_pull_diagnostics_lib_message,
             expected_pull_diagnostic_lib_message,
             expected_push_diagnostic_lib_message,
         ];
-        assert_eq!(all_diagnostics.len(), 1);
+        assert_eq!(all_diagnostics.len(), 2);
         for diagnostic in &all_diagnostics {
             assert!(
                 expected_messages.contains(&diagnostic.diagnostic.message.as_str()),
@@ -3400,7 +3406,7 @@ async fn test_lsp_pull_diagnostics(
     editor_b_main.update(cx_b, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(all_diagnostics.len(), 2);
 
@@ -3419,7 +3425,7 @@ async fn test_lsp_pull_diagnostics(
     editor_a_main.update(cx_a, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let all_diagnostics = snapshot
-            .diagnostics_in_range(0..snapshot.len())
+            .diagnostics_in_range(MultiBufferOffset(0)..snapshot.len())
             .collect::<Vec<_>>();
         assert_eq!(all_diagnostics.len(), 2);
         let expected_messages = [
@@ -3508,7 +3514,6 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
         .into_iter()
         .map(|(sha, message)| (sha.parse().unwrap(), message.into()))
         .collect(),
-        remote_url: Some("git@github.com:zed-industries/zed.git".to_string()),
     };
     client_a.fs().set_blame_for_repo(
         Path::new(path!("/my-repo/.git")),
@@ -3593,10 +3598,6 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
             for (idx, (buffer, entry)) in entries.iter().flatten().enumerate() {
                 let details = blame.details_for_entry(*buffer, entry).unwrap();
                 assert_eq!(details.message, format!("message for idx-{}", idx));
-                assert_eq!(
-                    details.permalink.unwrap().to_string(),
-                    format!("https://github.com/zed-industries/zed/commit/{}", entry.sha)
-                );
             }
         });
     });
@@ -4266,6 +4267,288 @@ async fn test_client_can_query_lsp_ext(cx_a: &mut TestAppContext, cx_b: &mut Tes
             });
         })
     });
+}
+
+#[gpui::test]
+async fn test_copy_file_name_without_extension(
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(cx_a.executor()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    cx_b.update(editor::init);
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "src": {
+                    "main.rs": indoc! {"
+                        fn main() {
+                            println!(\"Hello, world!\");
+                        }
+                    "},
+                }
+            }),
+        )
+        .await;
+
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/root"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
+
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    let editor_b = workspace_b
+        .update_in(cx_b, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.copy_file_name_without_extension(&CopyFileNameWithoutExtension, window, cx);
+    });
+
+    assert_eq!(
+        cx_a.read_from_clipboard().and_then(|item| item.text()),
+        Some("main".to_string())
+    );
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.copy_file_name_without_extension(&CopyFileNameWithoutExtension, window, cx);
+    });
+
+    assert_eq!(
+        cx_b.read_from_clipboard().and_then(|item| item.text()),
+        Some("main".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_name(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
+    let mut server = TestServer::start(cx_a.executor()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    cx_b.update(editor::init);
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "src": {
+                    "main.rs": indoc! {"
+                        fn main() {
+                            println!(\"Hello, world!\");
+                        }
+                    "},
+                }
+            }),
+        )
+        .await;
+
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/root"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
+
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    let editor_b = workspace_b
+        .update_in(cx_b, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.copy_file_name(&CopyFileName, window, cx);
+    });
+
+    assert_eq!(
+        cx_a.read_from_clipboard().and_then(|item| item.text()),
+        Some("main.rs".to_string())
+    );
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.copy_file_name(&CopyFileName, window, cx);
+    });
+
+    assert_eq!(
+        cx_b.read_from_clipboard().and_then(|item| item.text()),
+        Some("main.rs".to_string())
+    );
+}
+
+#[gpui::test]
+async fn test_copy_file_location(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
+    let mut server = TestServer::start(cx_a.executor()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    cx_b.update(editor::init);
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "src": {
+                    "main.rs": indoc! {"
+                        fn main() {
+                            println!(\"Hello, world!\");
+                        }
+                    "},
+                }
+            }),
+        )
+        .await;
+
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/root"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
+
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    let editor_b = workspace_b
+        .update_in(cx_b, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, rel_path("src/main.rs")),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(16)..MultiBufferOffset(16)]);
+        });
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    assert_eq!(
+        cx_a.read_from_clipboard().and_then(|item| item.text()),
+        Some(format!("{}:2", path!("src/main.rs")))
+    );
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(16)..MultiBufferOffset(16)]);
+        });
+        editor.copy_file_location(&CopyFileLocation, window, cx);
+    });
+
+    assert_eq!(
+        cx_b.read_from_clipboard().and_then(|item| item.text()),
+        Some(format!("{}:2", path!("src/main.rs")))
+    );
 }
 
 #[track_caller]

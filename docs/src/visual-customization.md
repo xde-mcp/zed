@@ -118,6 +118,7 @@ To disable this behavior use:
     "show_project_items": true,     // Show/hide project host and name
     "show_onboarding_banner": true, // Show/hide onboarding banners
     "show_user_picture": true,      // Show/hide user avatar
+    "show_user_menu": true,         // Show/hide app user button
     "show_sign_in": true,           // Show/hide sign-in button
     "show_menus": false             // Show/hide menus
   },
@@ -374,6 +375,8 @@ TBD: Centered layout related settings
   "lsp_document_colors": "inlay",        // none, inlay, border, background
   // When to show the scrollbar in the completion menu.
   "completion_menu_scrollbar": "never", // auto, system, always, never
+  // Turn on colorization of brackets in editors (configurable per language)
+  "colorize_brackets": true,
 ```
 
 ### Edit Predictions {#editor-ai}
