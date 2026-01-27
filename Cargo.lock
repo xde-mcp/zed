@@ -5643,8 +5643,13 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "encoding_rs",
+ "fuzzy",
  "gpui",
+ "language",
+ "picker",
+ "project",
  "ui",
+ "util",
  "workspace",
 ]
 
@@ -12661,6 +12666,7 @@ dependencies = [
  "dap",
  "dap_adapters",
  "db",
+ "encoding_rs",
  "extension",
  "fancy-regex",
  "fs",
@@ -16762,6 +16768,7 @@ dependencies = [
  "itertools 0.14.0",
  "language",
  "log",
+ "menu",
  "pretty_assertions",
  "project",
  "rand 0.9.2",
@@ -20688,6 +20695,7 @@ dependencies = [
  "cargo_metadata",
  "cargo_toml",
  "clap",
+ "extension",
  "gh-workflow",
  "indexmap",
  "indoc",

@@ -32,6 +32,11 @@ pub(crate) fn extension_tests() -> Workflow {
         .add_env(("RUST_BACKTRACE", 1))
         .add_env(("CARGO_INCREMENTAL", 0))
         .add_env(("ZED_EXTENSION_CLI_SHA", ZED_EXTENSION_CLI_SHA))
+        .add_env(("RUSTUP_TOOLCHAIN", "stable"))
+        .add_env((
+            "CARGO_BUILD_TARGET",
+            extension::extension_builder::RUST_TARGET,
+        ))
         .map(|workflow| {
             jobs.into_iter()
                 .chain([tests_pass])
@@ -39,6 +44,13 @@ pub(crate) fn extension_tests() -> Workflow {
                     workflow.add_job(job.name, job.job)
                 })
         })
+}
+
+fn install_rust_target() -> Step<Run> {
+    named::bash(format!(
+        "rustup target add {rust_target}",
+        rust_target = extension::extension_builder::RUST_TARGET
+    ))
 }
 
 fn run_clippy() -> Step<Run> {
@@ -52,11 +64,15 @@ fn check_rust() -> NamedJob {
         .timeout_minutes(6u32)
         .add_step(steps::checkout_repo())
         .add_step(steps::cache_rust_dependencies_namespace())
+        .add_step(install_rust_target())
         .add_step(steps::cargo_fmt())
         .add_step(run_clippy())
         .add_step(steps::cargo_install_nextest())
         .add_step(
-            steps::cargo_nextest(runners::Platform::Linux).add_env(("NEXTEST_NO_TESTS", "warn")),
+            steps::cargo_nextest(runners::Platform::Linux)
+                // Set the target to the current platform again
+                .with_target("$(rustc -vV | sed -n 's|host: ||p')")
+                .add_env(("NEXTEST_NO_TESTS", "warn")),
         );
 
     named::job(job)
