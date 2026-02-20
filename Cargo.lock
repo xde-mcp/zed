@@ -3035,6 +3035,7 @@ dependencies = [
  "http_client",
  "parking_lot",
  "serde_json",
+ "thiserror 2.0.17",
  "yawc",
 ]
 
@@ -4997,8 +4998,11 @@ name = "docs_preprocessor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
+ "jsonschema",
  "mdbook",
  "regex",
+ "schemars",
  "serde",
  "serde_json",
  "settings",
@@ -9105,6 +9109,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "client",
+ "cloud_api_client",
  "cloud_api_types",
  "cloud_llm_client",
  "collections",
@@ -13906,6 +13911,7 @@ dependencies = [
  "file_icons",
  "futures 0.3.31",
  "gpui",
+ "html_to_markdown",
  "http_client",
  "image",
  "indoc",
