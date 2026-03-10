@@ -668,7 +668,7 @@ mod tests {
             cursor_offset_in_excerpt: 0,
             excerpt_start_row,
             events,
-            related_files: Vec::new(),
+            related_files: Some(Vec::new()),
             excerpt_ranges: ExcerptRanges {
                 editable_150: 0..content.len(),
                 editable_180: 0..content.len(),
@@ -678,6 +678,7 @@ mod tests {
                 editable_350_context_150: 0..content.len(),
                 ..Default::default()
             },
+            syntax_ranges: None,
             experiment: None,
             in_open_source_repo: false,
             can_collect_data: false,
