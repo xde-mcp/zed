@@ -1,5 +1,6 @@
 use crate::{AgentPanel, AgentPanelEvent, NewThread};
 use acp_thread::ThreadStatus;
+use action_log::DiffStats;
 use agent::ThreadStore;
 use agent_client_protocol as acp;
 use agent_settings::AgentSettings;
@@ -73,6 +74,7 @@ struct ActiveThreadInfo {
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
     is_background: bool,
+    diff_stats: DiffStats,
 }
 
 impl From<&ActiveThreadInfo> for acp_thread::AgentSessionInfo {
@@ -98,6 +100,7 @@ struct ThreadEntry {
     is_live: bool,
     is_background: bool,
     highlight_positions: Vec<usize>,
+    diff_stats: DiffStats,
 }
 
 #[derive(Clone)]
@@ -402,6 +405,8 @@ impl Sidebar {
                     }
                 };
 
+                let diff_stats = thread.action_log().read(cx).diff_stats(cx);
+
                 ActiveThreadInfo {
                     session_id,
                     title,
@@ -409,6 +414,7 @@ impl Sidebar {
                     icon,
                     icon_from_external_svg,
                     is_background,
+                    diff_stats,
                 }
             })
             .collect()
@@ -472,6 +478,7 @@ impl Sidebar {
                             is_live: false,
                             is_background: false,
                             highlight_positions: Vec::new(),
+                            diff_stats: DiffStats::default(),
                         });
                     }
                 }
@@ -497,6 +504,7 @@ impl Sidebar {
                         thread.icon_from_external_svg = info.icon_from_external_svg.clone();
                         thread.is_live = true;
                         thread.is_background = info.is_background;
+                        thread.diff_stats = info.diff_stats;
                     }
                 }
 
@@ -705,6 +713,8 @@ impl Sidebar {
         let is_group_header_after_first =
             ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
 
+        let docked_right = AgentSettings::get_global(cx).dock == settings::DockPosition::Right;
+
         let rendered = match entry {
             ListEntry::ProjectHeader {
                 path_list,
@@ -720,9 +730,12 @@ impl Sidebar {
                 highlight_positions,
                 *has_threads,
                 is_selected,
+                docked_right,
                 cx,
             ),
-            ListEntry::Thread(thread) => self.render_thread(ix, thread, is_selected, cx),
+            ListEntry::Thread(thread) => {
+                self.render_thread(ix, thread, is_selected, docked_right, cx)
+            }
             ListEntry::ViewMore {
                 path_list,
                 remaining_count,
@@ -762,6 +775,7 @@ impl Sidebar {
         highlight_positions: &[usize],
         has_threads: bool,
         is_selected: bool,
+        docked_right: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = SharedString::from(format!("project-header-{}", ix));
@@ -807,12 +821,13 @@ impl Sidebar {
             .group_name(group_name)
             .toggle_state(is_active_workspace)
             .focused(is_selected)
+            .docked_right(docked_right)
             .child(
                 h_flex()
                     .relative()
                     .min_w_0()
                     .w_full()
-                    .p_1()
+                    .py_1()
                     .gap_1p5()
                     .child(
                         Icon::new(disclosure_icon)
@@ -961,7 +976,7 @@ impl Sidebar {
     }
 
     fn has_filter_query(&self, cx: &App) -> bool {
-        self.filter_editor.read(cx).buffer().read(cx).is_empty()
+        !self.filter_editor.read(cx).text(cx).is_empty()
     }
 
     fn editor_move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
@@ -1148,6 +1163,7 @@ impl Sidebar {
         ix: usize,
         thread: &ThreadEntry,
         is_selected: bool,
+        docked_right: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let has_notification = self
@@ -1163,16 +1179,50 @@ impl Sidebar {
         let workspace = thread.workspace.clone();
 
         let id = SharedString::from(format!("thread-entry-{}", ix));
+
+        let timestamp = thread
+            .session_info
+            .created_at
+            .or(thread.session_info.updated_at)
+            .map(|entry_time| {
+                let now = Utc::now();
+                let duration = now.signed_duration_since(entry_time);
+
+                let minutes = duration.num_minutes();
+                let hours = duration.num_hours();
+                let days = duration.num_days();
+                let weeks = days / 7;
+                let months = days / 30;
+
+                if minutes < 60 {
+                    format!("{}m", minutes.max(1))
+                } else if hours < 24 {
+                    format!("{}h", hours)
+                } else if weeks < 4 {
+                    format!("{}w", weeks.max(1))
+                } else {
+                    format!("{}mo", months.max(1))
+                }
+            });
+
         ThreadItem::new(id, title)
             .icon(thread.icon)
             .when_some(thread.icon_from_external_svg.clone(), |this, svg| {
                 this.custom_icon_from_external_svg(svg)
             })
+            .when_some(timestamp, |this, ts| this.timestamp(ts))
             .highlight_positions(thread.highlight_positions.to_vec())
             .status(thread.status)
             .notified(has_notification)
+            .when(thread.diff_stats.lines_added > 0, |this| {
+                this.added(thread.diff_stats.lines_added as usize)
+            })
+            .when(thread.diff_stats.lines_removed > 0, |this| {
+                this.removed(thread.diff_stats.lines_removed as usize)
+            })
             .selected(self.focused_thread.as_ref() == Some(&session_info.session_id))
             .focused(is_selected)
+            .docked_right(docked_right)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.selection = None;
                 this.activate_thread(session_info.clone(), &workspace, window, cx);
@@ -1226,7 +1276,7 @@ impl Sidebar {
             .focused(is_selected)
             .child(
                 h_flex()
-                    .p_1()
+                    .py_1()
                     .gap_1p5()
                     .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                     .child(Label::new(label).color(Color::Muted))
@@ -1287,6 +1337,7 @@ impl Sidebar {
         div()
             .w_full()
             .p_2()
+            .pt_1p5()
             .child(
                 Button::new(
                     SharedString::from(format!("new-thread-btn-{}", ix)),
@@ -1305,6 +1356,40 @@ impl Sidebar {
                 })),
             )
             .into_any_element()
+    }
+
+    fn render_sidebar_toggle_button(
+        &self,
+        docked_right: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let icon = if docked_right {
+            IconName::ThreadsSidebarRightOpen
+        } else {
+            IconName::ThreadsSidebarLeftOpen
+        };
+
+        h_flex()
+            .h_full()
+            .px_1()
+            .map(|this| {
+                if docked_right {
+                    this.pr_1p5().border_l_1()
+                } else {
+                    this.border_r_1()
+                }
+            })
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                IconButton::new("sidebar-close-toggle", icon)
+                    .icon_size(IconSize::Small)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action("Close Threads Sidebar", &ToggleWorkspaceSidebar, cx)
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(ToggleWorkspaceSidebar.boxed_clone(), cx);
+                    }),
+            )
     }
 }
 
@@ -1402,37 +1487,19 @@ impl Render for Sidebar {
             .child({
                 let docked_right =
                     AgentSettings::get_global(cx).dock == settings::DockPosition::Right;
-                let render_close_button = || {
-                    IconButton::new("sidebar-close-toggle", IconName::WorkspaceNavOpen)
-                        .icon_size(IconSize::Small)
-                        .tooltip(move |_, cx| {
-                            Tooltip::for_action(
-                                "Close Threads Sidebar",
-                                &ToggleWorkspaceSidebar,
-                                cx,
-                            )
-                        })
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(ToggleWorkspaceSidebar.boxed_clone(), cx);
-                        })
-                };
 
                 h_flex()
-                    .flex_none()
-                    .px_2p5()
                     .h(Tab::container_height(cx))
-                    .gap_2()
+                    .flex_none()
+                    .gap_1p5()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .when(!docked_right, |this| this.child(render_close_button()))
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .when(!docked_right, |this| {
+                        this.child(self.render_sidebar_toggle_button(false, cx))
+                    })
                     .child(self.render_filter_input(cx))
                     .when(has_query, |this| {
-                        this.pr_1().child(
+                        this.when(!docked_right, |this| this.pr_1p5()).child(
                             IconButton::new("clear_filter", IconName::Close)
                                 .shape(IconButtonShape::Square)
                                 .tooltip(Tooltip::text("Clear Search"))
@@ -1442,7 +1509,11 @@ impl Render for Sidebar {
                                 })),
                         )
                     })
-                    .when(docked_right, |this| this.child(render_close_button()))
+                    .when(docked_right, |this| {
+                        this.pl_2()
+                            .pr_0p5()
+                            .child(self.render_sidebar_toggle_button(true, cx))
+                    })
             })
             .child(
                 v_flex()
@@ -1987,6 +2058,7 @@ mod tests {
                     is_live: false,
                     is_background: false,
                     highlight_positions: Vec::new(),
+                    diff_stats: DiffStats::default(),
                 }),
                 // Active thread with Running status
                 ListEntry::Thread(ThreadEntry {
@@ -2005,6 +2077,7 @@ mod tests {
                     is_live: true,
                     is_background: false,
                     highlight_positions: Vec::new(),
+                    diff_stats: DiffStats::default(),
                 }),
                 // Active thread with Error status
                 ListEntry::Thread(ThreadEntry {
@@ -2023,6 +2096,7 @@ mod tests {
                     is_live: true,
                     is_background: false,
                     highlight_positions: Vec::new(),
+                    diff_stats: DiffStats::default(),
                 }),
                 // Thread with WaitingForConfirmation status, not active
                 ListEntry::Thread(ThreadEntry {
@@ -2041,6 +2115,7 @@ mod tests {
                     is_live: false,
                     is_background: false,
                     highlight_positions: Vec::new(),
+                    diff_stats: DiffStats::default(),
                 }),
                 // Background thread that completed (should show notification)
                 ListEntry::Thread(ThreadEntry {
@@ -2059,6 +2134,7 @@ mod tests {
                     is_live: true,
                     is_background: true,
                     highlight_positions: Vec::new(),
+                    diff_stats: DiffStats::default(),
                 }),
                 // View More entry
                 ListEntry::ViewMore {
