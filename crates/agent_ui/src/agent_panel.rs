@@ -29,12 +29,12 @@ use zed_actions::agent::{
     ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent, ReviewBranchDiff,
 };
 
-use crate::ui::{AcpOnboardingModal, ClaudeCodeOnboardingModal};
+use crate::ui::{AcpOnboardingModal, ClaudeCodeOnboardingModal, HoldForDefault};
 use crate::{
-    AddContextServer, AgentDiffPane, ConnectionView, CopyThreadToClipboard, Follow,
-    InlineAssistant, LoadThreadFromClipboard, NewTextThread, NewThread, OpenActiveThreadAsMarkdown,
-    OpenAgentDiff, OpenHistory, ResetTrialEndUpsell, ResetTrialUpsell, StartThreadIn,
-    ToggleNavigationMenu, ToggleNewThreadMenu, ToggleOptionsMenu, ToggleStartThreadInSelector,
+    AddContextServer, AgentDiffPane, ConnectionView, CopyThreadToClipboard, CycleStartThreadIn,
+    Follow, InlineAssistant, LoadThreadFromClipboard, NewTextThread, NewThread,
+    OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell, ResetTrialUpsell,
+    StartThreadIn, ToggleNavigationMenu, ToggleNewThreadMenu, ToggleOptionsMenu,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     connection_view::{AcpThreadViewEvent, ThreadView},
     slash_command::SlashCommandCompletionProvider,
@@ -42,7 +42,7 @@ use crate::{
     ui::EndTrialUpsell,
 };
 use crate::{
-    AgentInitialContent, ExternalAgent, ExternalSourcePrompt, NewExternalAgentThread,
+    Agent, AgentInitialContent, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
 };
 use crate::{
@@ -84,10 +84,10 @@ use ui::{
     KeyBinding, PopoverMenu, PopoverMenuHandle, SpinnerLabel, Tab, TintColor, Tooltip, prelude::*,
     utils::WithRemSize,
 };
-use util::ResultExt as _;
+use util::{ResultExt as _, debug_panic};
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedSidebar, DraggedTab, FocusWorkspaceSidebar,
-    MultiWorkspace, SIDEBAR_RESIZE_HANDLE_SIZE, ToggleWorkspaceSidebar, ToggleZoom,
+    MultiWorkspace, OpenResult, SIDEBAR_RESIZE_HANDLE_SIZE, ToggleWorkspaceSidebar, ToggleZoom,
     ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     multi_workspace_enabled,
@@ -312,18 +312,6 @@ pub fn init(cx: &mut App) {
                         });
                     }
                 })
-                .register_action(|workspace, _: &ToggleStartThreadInSelector, window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                        panel.update(cx, |panel, cx| {
-                            panel.toggle_start_thread_in_selector(
-                                &ToggleStartThreadInSelector,
-                                window,
-                                cx,
-                            );
-                        });
-                    }
-                })
                 .register_action(|workspace, _: &OpenAcpOnboardingModal, window, cx| {
                     AcpOnboardingModal::toggle(workspace, window, cx)
                 })
@@ -474,6 +462,13 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             panel.set_start_thread_in(action, cx);
+                        });
+                    }
+                })
+                .register_action(|workspace, _: &CycleStartThreadIn, _window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.cycle_start_thread_in(cx);
                         });
                     }
                 })
@@ -738,11 +733,11 @@ impl AgentType {
     }
 }
 
-impl From<ExternalAgent> for AgentType {
-    fn from(value: ExternalAgent) -> Self {
+impl From<Agent> for AgentType {
+    fn from(value: Agent) -> Self {
         match value {
-            ExternalAgent::Custom { name } => Self::Custom { name },
-            ExternalAgent::NativeAgent => Self::NativeAgent,
+            Agent::Custom { name } => Self::Custom { name },
+            Agent::NativeAgent => Self::NativeAgent,
         }
     }
 }
@@ -1178,6 +1173,17 @@ impl AgentPanel {
             None
         };
 
+        let connection_store = cx.new(|cx| {
+            let mut store = AgentConnectionStore::new(project.clone(), cx);
+            // Register the native agent right away, so that it is available for
+            // the inline assistant etc.
+            store.request_connection(
+                Agent::NativeAgent,
+                Agent::NativeAgent.server(fs.clone(), thread_store.clone()),
+                cx,
+            );
+            store
+        });
         let mut panel = Self {
             workspace_id,
             active_view,
@@ -1188,7 +1194,7 @@ impl AgentPanel {
             language_registry,
             text_thread_store,
             prompt_store,
-            connection_store: cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)),
+            connection_store,
             configuration: None,
             configuration_subscription: None,
             focus_handle: cx.focus_handle(),
@@ -1283,7 +1289,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.external_thread(
-            Some(crate::ExternalAgent::NativeAgent),
+            Some(crate::Agent::NativeAgent),
             Some(session_id),
             cwd,
             title,
@@ -1335,18 +1341,19 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let agent = ExternalAgent::NativeAgent;
-
-        let server = agent.server(self.fs.clone(), self.thread_store.clone());
         let session_id = action.from_session_id.clone();
 
-        let entry = self.connection_store.update(cx, |store, cx| {
-            store.request_connection(agent.clone(), server, cx)
-        });
-        let connect_task = entry.read(cx).wait_for_connection();
+        let Some(history) = self
+            .connection_store
+            .read(cx)
+            .entry(&Agent::NativeAgent)
+            .and_then(|e| e.read(cx).history().cloned())
+        else {
+            debug_panic!("Native agent is not registered");
+            return;
+        };
 
         cx.spawn_in(window, async move |this, cx| {
-            let history = connect_task.await?.history;
             this.update_in(cx, |this, window, cx| {
                 let thread = history
                     .read(cx)
@@ -1354,7 +1361,7 @@ impl AgentPanel {
                     .context("Session not found")?;
 
                 this.external_thread(
-                    Some(agent),
+                    Some(Agent::NativeAgent),
                     None,
                     None,
                     None,
@@ -1417,7 +1424,7 @@ impl AgentPanel {
 
     fn external_thread(
         &mut self,
-        agent_choice: Option<crate::ExternalAgent>,
+        agent_choice: Option<crate::Agent>,
         resume_session_id: Option<acp::SessionId>,
         cwd: Option<PathBuf>,
         title: Option<SharedString>,
@@ -1435,7 +1442,7 @@ impl AgentPanel {
 
         #[derive(Serialize, Deserialize)]
         struct LastUsedExternalAgent {
-            agent: crate::ExternalAgent,
+            agent: crate::Agent,
         }
 
         let thread_store = self.thread_store.clone();
@@ -1473,7 +1480,7 @@ impl AgentPanel {
         } else {
             cx.spawn_in(window, async move |this, cx| {
                 let ext_agent = if is_via_collab {
-                    ExternalAgent::NativeAgent
+                    Agent::NativeAgent
                 } else {
                     cx.background_spawn(async move {
                         KEY_VALUE_STORE.read_kvp(LAST_USED_EXTERNAL_AGENT_KEY)
@@ -1485,7 +1492,7 @@ impl AgentPanel {
                         serde_json::from_str::<LastUsedExternalAgent>(&value).log_err()
                     })
                     .map(|agent| agent.agent)
-                    .unwrap_or(ExternalAgent::NativeAgent)
+                    .unwrap_or(Agent::NativeAgent)
                 };
 
                 let server = ext_agent.server(fs, thread_store);
@@ -1554,7 +1561,7 @@ impl AgentPanel {
         match &self.selected_agent {
             AgentType::TextThread | AgentType::NativeAgent => true,
             AgentType::Custom { name } => {
-                let agent = ExternalAgent::Custom { name: name.clone() };
+                let agent = Agent::Custom { name: name.clone() };
                 self.connection_store
                     .read(cx)
                     .entry(&agent)
@@ -1574,7 +1581,7 @@ impl AgentPanel {
                 let history = self
                     .connection_store
                     .read(cx)
-                    .entry(&ExternalAgent::NativeAgent)?
+                    .entry(&Agent::NativeAgent)?
                     .read(cx)
                     .history()?
                     .clone();
@@ -1584,7 +1591,7 @@ impl AgentPanel {
                 })
             }
             AgentType::Custom { name } => {
-                let agent = ExternalAgent::Custom { name: name.clone() };
+                let agent = Agent::Custom { name: name.clone() };
                 let history = self
                     .connection_store
                     .read(cx)
@@ -1737,15 +1744,6 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.new_thread_menu_handle.toggle(window, cx);
-    }
-
-    pub fn toggle_start_thread_in_selector(
-        &mut self,
-        _: &ToggleStartThreadInSelector,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.start_thread_in_menu_handle.toggle(window, cx);
     }
 
     pub fn increase_font_size(
@@ -2376,10 +2374,32 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn selected_external_agent(&self) -> Option<ExternalAgent> {
+    fn cycle_start_thread_in(&mut self, cx: &mut Context<Self>) {
+        let next = match self.start_thread_in {
+            StartThreadIn::LocalProject => StartThreadIn::NewWorktree,
+            StartThreadIn::NewWorktree => StartThreadIn::LocalProject,
+        };
+        self.set_start_thread_in(&next, cx);
+    }
+
+    fn reset_start_thread_in_to_default(&mut self, cx: &mut Context<Self>) {
+        use settings::{NewThreadLocation, Settings};
+        let default = AgentSettings::get_global(cx).new_thread_location;
+        let start_thread_in = match default {
+            NewThreadLocation::LocalProject => StartThreadIn::LocalProject,
+            NewThreadLocation::NewWorktree => StartThreadIn::NewWorktree,
+        };
+        if self.start_thread_in != start_thread_in {
+            self.start_thread_in = start_thread_in;
+            self.serialize(cx);
+            cx.notify();
+        }
+    }
+
+    fn selected_external_agent(&self) -> Option<Agent> {
         match &self.selected_agent {
-            AgentType::NativeAgent => Some(ExternalAgent::NativeAgent),
-            AgentType::Custom { name } => Some(ExternalAgent::Custom { name: name.clone() }),
+            AgentType::NativeAgent => Some(Agent::NativeAgent),
+            AgentType::Custom { name } => Some(Agent::Custom { name: name.clone() }),
             AgentType::TextThread => None,
         }
     }
@@ -2433,6 +2453,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reset_start_thread_in_to_default(cx);
         self.new_agent_thread_inner(agent, true, window, cx);
     }
 
@@ -2448,7 +2469,7 @@ impl AgentPanel {
                 window.dispatch_action(NewTextThread.boxed_clone(), cx);
             }
             AgentType::NativeAgent => self.external_thread(
-                Some(crate::ExternalAgent::NativeAgent),
+                Some(crate::Agent::NativeAgent),
                 None,
                 None,
                 None,
@@ -2458,7 +2479,7 @@ impl AgentPanel {
                 cx,
             ),
             AgentType::Custom { name } => self.external_thread(
-                Some(crate::ExternalAgent::Custom { name }),
+                Some(crate::Agent::Custom { name }),
                 None,
                 None,
                 None,
@@ -2544,7 +2565,7 @@ impl AgentPanel {
         initial_content: Option<AgentInitialContent>,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
-        ext_agent: ExternalAgent,
+        ext_agent: Agent,
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2621,6 +2642,12 @@ impl AgentPanel {
         }
     }
 
+    // TODO: The mapping from workspace root paths to git repositories needs a
+    // unified approach across the codebase: this method, `sidebar::is_root_repo`,
+    // thread persistence (which PathList is saved to the database), and thread
+    // querying (which PathList is used to read threads back). All of these need
+    // to agree on how repos are resolved for a given workspace, especially in
+    // multi-root and nested-repo configurations.
     /// Partitions the project's visible worktrees into git-backed repositories
     /// and plain (non-git) paths. Git repos will have worktrees created for
     /// them; non-git paths are carried over to the new workspace as-is.
@@ -2998,20 +3025,15 @@ impl AgentPanel {
             workspace.set_dock_structure(dock_structure, window, cx);
         }));
 
-        let (new_window_handle, _) = cx
+        let OpenResult {
+            window: new_window_handle,
+            workspace: new_workspace,
+            ..
+        } = cx
             .update(|_window, cx| {
                 Workspace::new_local(all_paths, app_state, window_handle, None, init, false, cx)
             })?
             .await?;
-
-        let new_workspace = new_window_handle.update(cx, |multi_workspace, _window, _cx| {
-            let workspaces = multi_workspace.workspaces();
-            workspaces.last().cloned()
-        })?;
-
-        let Some(new_workspace) = new_workspace else {
-            anyhow::bail!("New workspace was not added to MultiWorkspace");
-        };
 
         let panels_task = new_window_handle.update(cx, |_, _, cx| {
             new_workspace.update(cx, |workspace, _cx| workspace.take_panels_task())
@@ -3580,9 +3602,12 @@ impl AgentPanel {
     }
 
     fn render_start_thread_in_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use settings::{NewThreadLocation, Settings};
+
         let focus_handle = self.focus_handle(cx);
         let has_git_repo = self.project_has_git_repository(cx);
         let is_via_collab = self.project.read(cx).is_via_collab();
+        let fs = self.fs.clone();
 
         let is_creating = matches!(
             self.worktree_creation_status,
@@ -3591,6 +3616,10 @@ impl AgentPanel {
 
         let current_target = self.start_thread_in;
         let trigger_label = self.start_thread_in.label();
+
+        let new_thread_location = AgentSettings::get_global(cx).new_thread_location;
+        let is_local_default = new_thread_location == NewThreadLocation::LocalProject;
+        let is_new_worktree_default = new_thread_location == NewThreadLocation::NewWorktree;
 
         let icon = if self.start_thread_in_menu_handle.is_deployed() {
             IconName::ChevronUp
@@ -3619,7 +3648,7 @@ impl AgentPanel {
                 move |_window, cx| {
                     Tooltip::for_action_in(
                         "Start Thread In…",
-                        &ToggleStartThreadInSelector,
+                        &CycleStartThreadIn,
                         &focus_handle,
                         cx,
                     )
@@ -3628,6 +3657,7 @@ impl AgentPanel {
             .menu(move |window, cx| {
                 let is_local_selected = current_target == StartThreadIn::LocalProject;
                 let is_new_worktree_selected = current_target == StartThreadIn::NewWorktree;
+                let fs = fs.clone();
 
                 Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
                     let new_worktree_disabled = !has_git_repo || is_via_collab;
@@ -3636,18 +3666,53 @@ impl AgentPanel {
                         .item(
                             ContextMenuEntry::new("Current Project")
                                 .toggleable(IconPosition::End, is_local_selected)
-                                .handler(|window, cx| {
-                                    window
-                                        .dispatch_action(Box::new(StartThreadIn::LocalProject), cx);
+                                .documentation_aside(documentation_side, move |_| {
+                                    HoldForDefault::new(is_local_default)
+                                        .more_content(false)
+                                        .into_any_element()
+                                })
+                                .handler({
+                                    let fs = fs.clone();
+                                    move |window, cx| {
+                                        if window.modifiers().secondary() {
+                                            update_settings_file(fs.clone(), cx, |settings, _| {
+                                                settings
+                                                    .agent
+                                                    .get_or_insert_default()
+                                                    .set_new_thread_location(
+                                                        NewThreadLocation::LocalProject,
+                                                    );
+                                            });
+                                        }
+                                        window.dispatch_action(
+                                            Box::new(StartThreadIn::LocalProject),
+                                            cx,
+                                        );
+                                    }
                                 }),
                         )
                         .item({
                             let entry = ContextMenuEntry::new("New Worktree")
                                 .toggleable(IconPosition::End, is_new_worktree_selected)
                                 .disabled(new_worktree_disabled)
-                                .handler(|window, cx| {
-                                    window
-                                        .dispatch_action(Box::new(StartThreadIn::NewWorktree), cx);
+                                .handler({
+                                    let fs = fs.clone();
+                                    move |window, cx| {
+                                        if window.modifiers().secondary() {
+                                            update_settings_file(fs.clone(), cx, |settings, _| {
+                                                settings
+                                                    .agent
+                                                    .get_or_insert_default()
+                                                    .set_new_thread_location(
+                                                        NewThreadLocation::NewWorktree,
+                                                    );
+                                            });
+                                        }
+                                        window.dispatch_action(
+                                            Box::new(StartThreadIn::NewWorktree),
+                                            cx,
+                                        );
+                                    }
                                 });
 
                             if new_worktree_disabled {
@@ -3663,7 +3728,11 @@ impl AgentPanel {
                                         .into_any_element()
                                 })
                             } else {
-                                entry
+                                entry.documentation_aside(documentation_side, move |_| {
+                                    HoldForDefault::new(is_new_worktree_default)
+                                        .more_content(false)
+                                        .into_any_element()
+                                })
                             }
                         })
                 }))
@@ -4837,7 +4906,6 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::toggle_navigation_menu))
             .on_action(cx.listener(Self::toggle_options_menu))
-            .on_action(cx.listener(Self::toggle_start_thread_in_selector))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
@@ -4976,7 +5044,7 @@ impl rules_library::InlineAssistDelegate for PromptLibraryInlineAssist {
                 .read(cx)
                 .connection_store()
                 .read(cx)
-                .entry(&crate::ExternalAgent::NativeAgent)
+                .entry(&crate::Agent::NativeAgent)
                 .and_then(|s| s.read(cx).history())
             else {
                 log::error!("No connection entry found for native agent");
@@ -5158,7 +5226,7 @@ impl AgentPanel {
         let workspace = self.workspace.clone();
         let project = self.project.clone();
 
-        let ext_agent = ExternalAgent::Custom {
+        let ext_agent = Agent::Custom {
             name: server.name(),
         };
 
