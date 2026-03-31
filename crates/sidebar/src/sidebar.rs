@@ -68,6 +68,14 @@ gpui::actions!(
     ]
 );
 
+gpui::actions!(
+    dev,
+    [
+        /// Dumps multi-workspace state (projects, worktrees, active threads) into a new buffer.
+        DumpWorkspaceInfo,
+    ]
+);
+
 const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
@@ -158,6 +166,7 @@ enum ListEntry {
         path_list: PathList,
         workspace: Entity<Workspace>,
         is_active_draft: bool,
+        worktrees: Vec<WorktreeInfo>,
     },
 }
 
@@ -739,6 +748,7 @@ impl Sidebar {
                 .collect();
 
             let mut threads: Vec<ThreadEntry> = Vec::new();
+            let mut threadless_workspaces: Vec<(Entity<Workspace>, Vec<WorktreeInfo>)> = Vec::new();
             let mut has_running_threads = false;
             let mut waiting_thread_count: usize = 0;
 
@@ -749,8 +759,16 @@ impl Sidebar {
                 // Load threads from each workspace in the group.
                 for workspace in &group.workspaces {
                     let ws_path_list = workspace_path_list(workspace, cx);
-
-                    for row in thread_store.read(cx).entries_for_path(&ws_path_list) {
+                    let mut workspace_rows = thread_store
+                        .read(cx)
+                        .entries_for_path(&ws_path_list)
+                        .peekable();
+                    if workspace_rows.peek().is_none() {
+                        let worktrees =
+                            worktree_info_from_thread_paths(&ws_path_list, &project_groups);
+                        threadless_workspaces.push((workspace.clone(), worktrees));
+                    }
+                    for row in workspace_rows {
                         if !seen_session_ids.insert(row.session_id.clone()) {
                             continue;
                         }
@@ -773,7 +791,7 @@ impl Sidebar {
                     }
                 }
 
-                // Load threads from linked git worktrees
+                // Load threads from linked git worktrees whose
                 // canonical paths belong to this group.
                 let linked_worktree_queries = group
                     .workspaces
@@ -929,13 +947,10 @@ impl Sidebar {
                     entries.push(thread.into());
                 }
             } else {
-                let thread_count = threads.len();
                 let is_draft_for_workspace = self.agent_panel_visible
                     && self.active_thread_is_draft
                     && self.focused_thread.is_none()
                     && is_active;
-
-                let show_new_thread_entry = thread_count == 0 || is_draft_for_workspace;
 
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
@@ -952,11 +967,29 @@ impl Sidebar {
                     continue;
                 }
 
-                if show_new_thread_entry {
+                // Emit "New Thread" entries for threadless workspaces
+                // and active drafts, right after the header.
+                for (workspace, worktrees) in &threadless_workspaces {
+                    let is_draft = is_draft_for_workspace && workspace == representative_workspace;
+                    entries.push(ListEntry::NewThread {
+                        path_list: path_list.clone(),
+                        workspace: workspace.clone(),
+                        is_active_draft: is_draft,
+                        worktrees: worktrees.clone(),
+                    });
+                }
+                if is_draft_for_workspace
+                    && !threadless_workspaces
+                        .iter()
+                        .any(|(ws, _)| ws == representative_workspace)
+                {
+                    let ws_path_list = workspace_path_list(representative_workspace, cx);
+                    let worktrees = worktree_info_from_thread_paths(&ws_path_list, &project_groups);
                     entries.push(ListEntry::NewThread {
                         path_list: path_list.clone(),
                         workspace: representative_workspace.clone(),
-                        is_active_draft: is_draft_for_workspace,
+                        is_active_draft: true,
+                        worktrees,
                     });
                 }
 
@@ -1114,9 +1147,16 @@ impl Sidebar {
                 path_list,
                 workspace,
                 is_active_draft,
-            } => {
-                self.render_new_thread(ix, path_list, workspace, *is_active_draft, is_selected, cx)
-            }
+                worktrees,
+            } => self.render_new_thread(
+                ix,
+                path_list,
+                workspace,
+                *is_active_draft,
+                worktrees,
+                is_selected,
+                cx,
+            ),
         };
 
         if is_group_header_after_first {
@@ -2906,6 +2946,7 @@ impl Sidebar {
         _path_list: &PathList,
         workspace: &Entity<Workspace>,
         is_active_draft: bool,
+        worktrees: &[WorktreeInfo],
         is_selected: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2924,6 +2965,16 @@ impl Sidebar {
         let thread_item = ThreadItem::new(id, label)
             .icon(IconName::Plus)
             .icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.8)))
+            .worktrees(
+                worktrees
+                    .iter()
+                    .map(|wt| ThreadItemWorktreeInfo {
+                        name: wt.name.clone(),
+                        full_path: wt.full_path.clone(),
+                        highlight_positions: wt.highlight_positions.clone(),
+                    })
+                    .collect(),
+            )
             .selected(is_active)
             .focused(is_selected)
             .when(!is_active, |this| {
@@ -3404,4 +3455,198 @@ fn all_thread_infos_for_workspace(
         });
 
     Some(threads).into_iter().flatten()
+}
+
+pub fn dump_workspace_info(
+    workspace: &mut Workspace,
+    _: &DumpWorkspaceInfo,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    let this_entity = cx.entity();
+
+    let multi_workspace = workspace.multi_workspace().and_then(|weak| weak.upgrade());
+    let workspaces: Vec<gpui::Entity<Workspace>> = match &multi_workspace {
+        Some(mw) => mw.read(cx).workspaces().to_vec(),
+        None => vec![this_entity.clone()],
+    };
+    let active_index = multi_workspace
+        .as_ref()
+        .map(|mw| mw.read(cx).active_workspace_index());
+
+    writeln!(output, "MultiWorkspace: {} workspace(s)", workspaces.len()).ok();
+    if let Some(index) = active_index {
+        writeln!(output, "Active workspace index: {index}").ok();
+    }
+    writeln!(output).ok();
+
+    for (index, ws) in workspaces.iter().enumerate() {
+        let is_active = active_index == Some(index);
+        writeln!(
+            output,
+            "--- Workspace {index}{} ---",
+            if is_active { " (active)" } else { "" }
+        )
+        .ok();
+
+        // The action handler is already inside an update on `this_entity`,
+        // so we must avoid a nested read/update on that same entity.
+        if *ws == this_entity {
+            dump_single_workspace(workspace, &mut output, cx);
+        } else {
+            ws.read_with(cx, |ws, cx| {
+                dump_single_workspace(ws, &mut output, cx);
+            });
+        }
+    }
+
+    let project = workspace.project().clone();
+    cx.spawn_in(window, async move |_this, cx| {
+        let buffer = project
+            .update(cx, |project, cx| project.create_buffer(None, false, cx))
+            .await?;
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text(output, cx);
+        });
+
+        let buffer = cx.new(|cx| {
+            editor::MultiBuffer::singleton(buffer, cx).with_title("Workspace Info".into())
+        });
+
+        _this.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(cx.new(|cx| {
+                    let mut editor =
+                        editor::Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
+                    editor.set_read_only(true);
+                    editor.set_should_serialize(false, cx);
+                    editor.set_breadcrumb_header("Workspace Info".into());
+                    editor
+                })),
+                None,
+                true,
+                window,
+                cx,
+            );
+        })
+    })
+    .detach_and_log_err(cx);
+}
+
+fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::App) {
+    use std::fmt::Write;
+
+    let workspace_db_id = workspace.database_id();
+    match workspace_db_id {
+        Some(id) => writeln!(output, "Workspace DB ID: {id:?}").ok(),
+        None => writeln!(output, "Workspace DB ID: (none)").ok(),
+    };
+
+    let project = workspace.project().read(cx);
+
+    let repos: Vec<_> = project
+        .repositories(cx)
+        .values()
+        .map(|repo| repo.read(cx).snapshot())
+        .collect();
+
+    writeln!(output, "Worktrees:").ok();
+    for worktree in project.worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let abs_path = worktree.abs_path();
+        let visible = worktree.is_visible();
+
+        let repo_info = repos
+            .iter()
+            .find(|snapshot| abs_path.starts_with(&*snapshot.work_directory_abs_path));
+
+        let is_linked = repo_info.map(|s| s.is_linked_worktree()).unwrap_or(false);
+        let original_repo_path = repo_info.map(|s| &s.original_repo_abs_path);
+        let branch = repo_info.and_then(|s| s.branch.as_ref().map(|b| b.ref_name.clone()));
+
+        write!(output, "  - {}", abs_path.display()).ok();
+        if !visible {
+            write!(output, " (hidden)").ok();
+        }
+        if let Some(branch) = &branch {
+            write!(output, " [branch: {branch}]").ok();
+        }
+        if is_linked {
+            if let Some(original) = original_repo_path {
+                write!(output, " [linked worktree -> {}]", original.display()).ok();
+            } else {
+                write!(output, " [linked worktree]").ok();
+            }
+        }
+        writeln!(output).ok();
+    }
+
+    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+        let panel = panel.read(cx);
+
+        let panel_workspace_id = panel.workspace_id();
+        if panel_workspace_id != workspace_db_id {
+            writeln!(
+                output,
+                "  \u{26a0} workspace ID mismatch! panel has {panel_workspace_id:?}, workspace has {workspace_db_id:?}"
+            )
+            .ok();
+        }
+
+        if let Some(thread) = panel.active_agent_thread(cx) {
+            let thread = thread.read(cx);
+            let title = thread.title().unwrap_or_else(|| "(untitled)".into());
+            let session_id = thread.session_id();
+            let status = match thread.status() {
+                ThreadStatus::Idle => "idle",
+                ThreadStatus::Generating => "generating",
+            };
+            let entry_count = thread.entries().len();
+            write!(output, "Active thread: {title} (session: {session_id})").ok();
+            write!(output, " [{status}, {entry_count} entries").ok();
+            if thread.is_waiting_for_confirmation() {
+                write!(output, ", awaiting confirmation").ok();
+            }
+            writeln!(output, "]").ok();
+        } else {
+            writeln!(output, "Active thread: (none)").ok();
+        }
+
+        let background_threads = panel.background_threads();
+        if !background_threads.is_empty() {
+            writeln!(
+                output,
+                "Background threads ({}): ",
+                background_threads.len()
+            )
+            .ok();
+            for (session_id, conversation_view) in background_threads {
+                if let Some(thread_view) = conversation_view.read(cx).root_thread(cx) {
+                    let thread = thread_view.read(cx).thread.read(cx);
+                    let title = thread.title().unwrap_or_else(|| "(untitled)".into());
+                    let status = match thread.status() {
+                        ThreadStatus::Idle => "idle",
+                        ThreadStatus::Generating => "generating",
+                    };
+                    let entry_count = thread.entries().len();
+                    write!(output, "  - {title} (session: {session_id})").ok();
+                    write!(output, " [{status}, {entry_count} entries").ok();
+                    if thread.is_waiting_for_confirmation() {
+                        write!(output, ", awaiting confirmation").ok();
+                    }
+                    writeln!(output, "]").ok();
+                } else {
+                    writeln!(output, "  - (not connected) (session: {session_id})").ok();
+                }
+            }
+        }
+    } else {
+        writeln!(output, "Agent panel: not loaded").ok();
+    }
+
+    writeln!(output).ok();
 }
