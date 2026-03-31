@@ -29,7 +29,7 @@ pub use crate::notifications::NotificationFrame;
 pub use dock::Panel;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MultiWorkspace,
-    MultiWorkspaceEvent, NextWorkspace, PreviousWorkspace, Sidebar, SidebarHandle,
+    MultiWorkspaceEvent, NextWorkspace, PreviousWorkspace, Sidebar, SidebarEvent, SidebarHandle,
     SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar, sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
@@ -4185,6 +4185,17 @@ impl Workspace {
                 });
             }
         }
+    }
+
+    /// Open the panel of the given type, dismissing any zoomed items that
+    /// would obscure it (e.g. a zoomed terminal).
+    pub fn reveal_panel<T: Panel>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dock_position = self.all_docks().iter().find_map(|dock| {
+            let dock = dock.read(cx);
+            dock.panel_index_for_type::<T>().map(|_| dock.position())
+        });
+        self.dismiss_zoomed_items_to_reveal(dock_position, window, cx);
+        self.open_panel::<T>(window, cx);
     }
 
     pub fn close_panel<T: Panel>(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8683,6 +8694,18 @@ pub async fn restore_multiworkspace(
         window_handle
             .update(cx, |multi_workspace, _, cx| {
                 multi_workspace.open_sidebar(cx);
+            })
+            .ok();
+    }
+
+    if let Some(sidebar_state) = &state.sidebar_state {
+        let sidebar_state = sidebar_state.clone();
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                if let Some(sidebar) = multi_workspace.sidebar() {
+                    sidebar.restore_serialized_state(&sidebar_state, window, cx);
+                }
+                multi_workspace.serialize(cx);
             })
             .ok();
     }
